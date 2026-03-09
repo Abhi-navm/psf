@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     deepface_device: str = "cuda"  # Device for DeepFace (cuda or cpu)
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3:8b"
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.1-8b-instant"
     
     # Analysis Settings
     max_video_duration_seconds: int = 1800  # 30 minutes for longer videos

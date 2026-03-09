@@ -54,19 +54,71 @@ class ContentAnalyzer:
     def __init__(self):
         """Initialize the content analyzer."""
         self._llm_client = None
+        self._groq_client = None
+        self._llm_backend = None  # "ollama" or "groq"
     
     @property
     def llm_client(self):
-        """Lazy load Ollama client."""
-        if self._llm_client is None:
+        """Lazy load LLM client — try Ollama first, then Groq."""
+        if self._llm_client is None and self._llm_backend is None:
+            # Try Ollama first (local dev)
             try:
                 import ollama
-                self._llm_client = ollama.Client(host=settings.ollama_base_url)
-                logger.info(f"Ollama client connected to {settings.ollama_base_url}")
-            except Exception as e:
-                logger.warning(f"Could not connect to Ollama: {e}")
-                self._llm_client = None
+                client = ollama.Client(host=settings.ollama_base_url)
+                client.list()  # Test connection
+                self._llm_client = client
+                self._llm_backend = "ollama"
+                logger.info(f"Using Ollama at {settings.ollama_base_url}")
+            except Exception:
+                pass
+            
+            # Fall back to Groq
+            if self._llm_client is None and settings.groq_api_key:
+                try:
+                    from groq import Groq
+                    self._groq_client = Groq(api_key=settings.groq_api_key)
+                    self._llm_backend = "groq"
+                    logger.info("Using Groq API for LLM")
+                except Exception as e:
+                    logger.warning(f"Could not initialize Groq: {e}")
+            
+            if self._llm_backend is None:
+                self._llm_backend = "none"
+                logger.warning("No LLM backend available (no Ollama, no Groq API key)")
+        
         return self._llm_client
+    
+    def _llm_generate(self, prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> Optional[str]:
+        """Generate text using whatever LLM backend is available."""
+        # Ensure client is initialized
+        _ = self.llm_client
+        
+        if self._llm_backend == "ollama" and self._llm_client:
+            try:
+                response = self._llm_client.generate(
+                    model=settings.ollama_model,
+                    prompt=prompt,
+                    options={"temperature": temperature, "num_predict": max_tokens}
+                )
+                return response.get("response", "").strip()
+            except Exception as e:
+                logger.warning(f"Ollama generation failed: {e}")
+                return None
+        
+        if self._llm_backend == "groq" and self._groq_client:
+            try:
+                response = self._groq_client.chat.completions.create(
+                    model=settings.groq_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                logger.warning(f"Groq generation failed: {e}")
+                return None
+        
+        return None
     
     def analyze(
         self, 
@@ -269,39 +321,27 @@ class ContentAnalyzer:
     
     def _extract_key_points(self, transcript: str) -> List[str]:
         """Extract key points from the transcript using LLM."""
-        if self.llm_client is None:
-            return self._extract_key_points_simple(transcript)
-        
-        try:
-            prompt = f"""Analyze this sales pitch transcript and extract the 3-5 key points or main messages being communicated. Be concise.
+        prompt = f"""Analyze this sales pitch transcript and extract the 3-5 key points or main messages being communicated. Be concise.
 
 Transcript:
-{transcript[:3000]}  # Limit to first 3000 chars
+{transcript[:3000]}
 
 Return only a JSON array of strings with the key points, like:
 ["Key point 1", "Key point 2", "Key point 3"]
 """
-            
-            response = self.llm_client.generate(
-                model=settings.ollama_model,
-                prompt=prompt,
-                options={"temperature": 0.3, "num_predict": 200}
-            )
-            
-            # Parse response
-            import json
-            response_text = response.get("response", "[]")
-            
-            # Try to extract JSON array
-            match = re.search(r'\[.*\]', response_text, re.DOTALL)
-            if match:
-                return json.loads(match.group())
-            
-            return self._extract_key_points_simple(transcript)
-            
-        except Exception as e:
-            logger.warning(f"LLM key point extraction failed: {e}")
-            return self._extract_key_points_simple(transcript)
+        
+        response_text = self._llm_generate(prompt, max_tokens=200, temperature=0.3)
+        
+        if response_text:
+            try:
+                import json
+                match = re.search(r'\[.*\]', response_text, re.DOTALL)
+                if match:
+                    return json.loads(match.group())
+            except Exception as e:
+                logger.warning(f"LLM key point parsing failed: {e}")
+        
+        return self._extract_key_points_simple(transcript)
     
     def _extract_key_points_simple(self, transcript: str) -> List[str]:
         """Simple key point extraction without LLM."""
@@ -313,11 +353,7 @@ Return only a JSON array of strings with the key points, like:
     
     def _get_llm_feedback(self, transcript: str) -> Optional[str]:
         """Get comprehensive feedback from LLM."""
-        if self.llm_client is None:
-            return None
-        
-        try:
-            prompt = f"""You are a sales presentation coach. Analyze this sales pitch transcript and provide constructive feedback.
+        prompt = f"""You are a sales presentation coach. Analyze this sales pitch transcript and provide constructive feedback.
 
 Transcript:
 {transcript[:4000]}
@@ -329,18 +365,8 @@ Provide brief feedback (max 200 words) covering:
 4. One specific actionable tip
 
 Be encouraging but honest."""
-            
-            response = self.llm_client.generate(
-                model=settings.ollama_model,
-                prompt=prompt,
-                options={"temperature": 0.5, "num_predict": 300}
-            )
-            
-            return response.get("response", "").strip()
-            
-        except Exception as e:
-            logger.warning(f"LLM feedback generation failed: {e}")
-            return None
+        
+        return self._llm_generate(prompt, max_tokens=300, temperature=0.5)
     
     def _calculate_scores(
         self,

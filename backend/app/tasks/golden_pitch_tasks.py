@@ -4,16 +4,30 @@ Celery tasks for processing golden pitch deck videos.
 
 import os
 import asyncio
+import time
+import logging as _logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
-from celery import shared_task
-from celery.utils.log import get_task_logger
-
 from app.core.config import settings
 
-logger = get_task_logger(__name__)
+logger = _logging.getLogger(__name__)
+logger.setLevel(_logging.INFO)
+if not any(isinstance(h, _logging.StreamHandler) for h in logger.handlers):
+    logger.addHandler(_logging.StreamHandler())
+
+# Celery decorator — only import if available
+def _noop_task(bind=True, max_retries=2):
+    def wrapper(func):
+        func.delay = lambda *a, **kw: None
+        return func
+    return wrapper
+
+try:
+    from celery import shared_task
+except ImportError:
+    shared_task = _noop_task
 
 
 def get_or_create_event_loop():
@@ -38,6 +52,130 @@ def run_async(coro):
 @shared_task(bind=True, max_retries=2)
 def process_golden_pitch_deck(
     self,
+    golden_pitch_deck_id: str,
+    video_id: str,
+    video_path: str,
+) -> Dict[str, Any]:
+    """
+    Process a golden pitch deck video to extract reference metrics.
+    """
+    # If RunPod is configured, delegate
+    if settings.runpod_endpoint_id and settings.runpod_api_key:
+        return _process_golden_via_runpod(golden_pitch_deck_id, video_id, video_path)
+
+    return _process_golden_locally(golden_pitch_deck_id, video_id, video_path)
+
+
+def _process_golden_via_runpod(
+    golden_pitch_deck_id: str,
+    video_id: str,
+    video_path: str,
+) -> Dict[str, Any]:
+    """Send golden pitch to RunPod, get back analysis, extract reference data locally."""
+    import base64
+    import httpx
+    from app.db.database import async_session_maker
+    from app.db.models import GoldenPitchDeck
+    from sqlalchemy import update as sql_update
+    from app.analyzers.comparison import ComparisonAnalyzer
+
+    async def update_status(is_processed: bool = False, error: str = None, **kwargs):
+        async with async_session_maker() as session:
+            values = {"is_processed": is_processed, "processing_error": error,
+                       "updated_at": datetime.utcnow(), **kwargs}
+            stmt = sql_update(GoldenPitchDeck).where(
+                GoldenPitchDeck.id == golden_pitch_deck_id
+            ).values(**values)
+            await session.execute(stmt)
+            await session.commit()
+
+    try:
+        logger.info(f"Processing golden pitch deck {golden_pitch_deck_id} via RunPod")
+        base_url = f"https://api.runpod.ai/v2/{settings.runpod_endpoint_id}"
+        headers = {
+            "Authorization": f"Bearer {settings.runpod_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # Upload video to temp file host (RunPod has 10MB request body limit)
+        from app.tasks.analysis_tasks import _upload_to_temp_host
+        video_url = _upload_to_temp_host(video_path)
+
+        payload = {"input": {"video_url": video_url}}
+
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(f"{base_url}/run", headers=headers, json=payload)
+            resp.raise_for_status()
+            job = resp.json()
+
+        job_id = job["id"]
+        logger.info(f"RunPod golden pitch job: {job_id}")
+
+        # Poll for completion
+        max_wait = 600
+        elapsed = 0
+        result = None
+
+        with httpx.Client(timeout=30) as client:
+            while elapsed < max_wait:
+                time.sleep(5)
+                elapsed += 5
+                status_resp = client.get(f"{base_url}/status/{job_id}", headers=headers)
+                status_resp.raise_for_status()
+                data = status_resp.json()
+                status = data.get("status")
+
+                if status == "COMPLETED":
+                    result = data.get("output", {})
+                    break
+                elif status == "FAILED":
+                    raise RuntimeError(data.get("error", "RunPod job failed"))
+
+        if result is None:
+            raise TimeoutError(f"RunPod job timed out after {max_wait}s")
+        if "error" in result:
+            raise RuntimeError(result["error"])
+
+        # Extract reference data from RunPod results
+        transcription = result.get("transcription", {})
+        transcript = transcription.get("text", "")
+
+        # Use actual analysis results returned by RunPod handler
+        voice_analysis = result.get("voice_analysis", {"skipped": True})
+        pose_analysis = result.get("pose_analysis", {"skipped": True})
+        facial_analysis = result.get("facial_analysis", {"skipped": True})
+        content_analysis = result.get("content_analysis", {"skipped": True})
+
+        comparison_analyzer = ComparisonAnalyzer()
+        reference_data = comparison_analyzer.extract_reference_data(
+            transcript=transcript,
+            voice_analysis=voice_analysis,
+            pose_analysis=pose_analysis,
+            facial_analysis=facial_analysis,
+            content_analysis=content_analysis,
+        )
+
+        run_async(update_status(
+            is_processed=True,
+            keywords=reference_data.get("keywords"),
+            key_phrases=reference_data.get("key_phrases"),
+            voice_metrics=reference_data.get("voice_metrics"),
+            pose_metrics=reference_data.get("pose_metrics"),
+            facial_metrics=reference_data.get("facial_metrics"),
+            content_metrics=reference_data.get("content_metrics"),
+            transcript=transcript,
+        ))
+
+        logger.info(f"Golden pitch deck {golden_pitch_deck_id} processed via RunPod")
+        return {"success": True, "golden_pitch_deck_id": golden_pitch_deck_id}
+
+    except Exception as e:
+        logger.error(f"Golden pitch deck RunPod processing failed: {e}")
+        run_async(update_status(is_processed=False, error=str(e)))
+        raise
+
+
+def _process_golden_locally(
     golden_pitch_deck_id: str,
     video_id: str,
     video_path: str,

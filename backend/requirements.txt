@@ -1,0 +1,52 @@
+# FastAPI & Web
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+
+# Async & Task Queue
+celery[redis]==5.3.6
+redis==5.0.1
+flower==2.0.1
+
+# Database
+sqlalchemy==2.0.25
+alembic==1.13.1
+aiosqlite==0.19.0
+
+# AI/ML - Transcription (torch installed separately in Dockerfile)
+faster-whisper>=1.0.0
+
+# AI/ML - Voice Analysis
+librosa==0.10.2
+soundfile==0.12.1
+
+# AI/ML - Facial Analysis
+deepface==0.0.93
+opencv-python>=4.9.0
+tf-keras>=2.18.0
+
+# AI/ML - Body Pose
+mediapipe>=0.10.14
+
+# AI/ML - LLM
+ollama>=0.4.0
+
+# AI/ML - Semantic Similarity
+sentence-transformers>=2.2.0
+
+# Video Processing
+moviepy==1.0.3
+ffmpeg-python==0.2.0
+
+# Utils
+python-dotenv==1.0.0
+httpx>=0.25.0
+aiofiles==23.2.1
+numpy==1.26.4
+pandas==2.1.4
+pyyaml==6.0.1
+loguru==0.7.2

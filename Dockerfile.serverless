@@ -1,0 +1,81 @@
+# RunPod Serverless Dockerfile
+# Optimized for pay-per-second GPU inference
+
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# GPU / ML environment
+ENV TF_FORCE_GPU_ALLOW_GROWTH=true \
+    TF_CPP_MIN_LOG_LEVEL=2 \
+    CUDA_VISIBLE_DEVICES=0 \
+    WHISPER_DEVICE=cuda \
+    WHISPER_MODEL=large-v3 \
+    EMBEDDING_DEVICE=cuda \
+    DEEPFACE_DEVICE=cuda
+
+WORKDIR /app
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    curl \
+    git \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Python venv
+RUN python3.11 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Pin setuptools (<82 breaks ctranslate2/faster-whisper)
+RUN pip install --upgrade pip && pip install "setuptools<82"
+
+# PyTorch + CUDA
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install backend requirements
+COPY backend/requirements.txt /app/backend/requirements.txt
+RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+
+# Install runpod SDK
+RUN pip install --no-cache-dir runpod httpx
+
+# Pre-download ML models so workers start warm
+RUN python3.11 -c "\
+from faster_whisper import WhisperModel; \
+WhisperModel('large-v3', device='cpu', compute_type='int8'); \
+print('Whisper large-v3 cached')" \
+    && python3.11 -c "\
+from sentence_transformers import SentenceTransformer; \
+SentenceTransformer('all-MiniLM-L6-v2'); \
+print('SentenceTransformer cached')" \
+    && python3.11 -c "\
+from deepface import DeepFace; \
+DeepFace.analyze(img_path='https://raw.githubusercontent.com/serengil/deepface/master/tests/dataset/img1.jpg', actions=['emotion'], enforce_detection=False, silent=True); \
+print('DeepFace models cached')" || true
+# Now enable offline mode so runtime doesn't hit the network
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+# Copy backend code (analyzers, core config, etc.)
+COPY backend /app/backend
+
+# Copy serverless handler
+COPY serverless/handler.py /app/handler.py
+
+# Create working directories
+RUN mkdir -p /app/backend/data/uploads /app/backend/logs /tmp/spa
+
+WORKDIR /app
+
+CMD ["python3.11", "handler.py"]

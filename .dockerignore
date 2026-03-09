@@ -1,0 +1,62 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+ENV
+backend/.venv
+backend/.env
+
+# Node
+node_modules
+.next
+.npm
+frontend/.next
+frontend/node_modules
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+backend/logs/
+
+# Local data
+backend/data/uploads/*
+backend/data/*.db
+!backend/data/.gitkeep
+
+# Test
+.pytest_cache
+.coverage
+htmlcov
+
+# Documentation
+*.md
+!README.md
+!RUNPOD_DEPLOYMENT.md
+
+# Development files
+docker-compose.yml
+*.bat
+*.ps1
+sample_pitch/
+Dockerfile.runpod
+
+# Models (downloaded at build time)
+

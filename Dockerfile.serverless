@@ -48,6 +48,10 @@ RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pyt
 COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
+# Fix CuDNN version mismatch: TensorFlow needs CuDNN 9.3+ but base image has 8.x
+RUN pip install --no-cache-dir nvidia-cudnn-cu12==9.3.0.75
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.11/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+
 # Install runpod SDK
 RUN pip install --no-cache-dir runpod httpx
 

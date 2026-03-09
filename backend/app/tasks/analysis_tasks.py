@@ -153,48 +153,88 @@ def _run_via_runpod(
         logger.info(f"RunPod job submitted: {job_id}")
         run_async(update_status(AnalysisStatus.TRANSCRIBING, 25))
 
-        # Poll for completion
-        poll_interval = 5
-        max_wait = 600  # 10 minutes
-        elapsed = 0
+        # Submit + poll with retry logic for stale-worker failures
+        MAX_ATTEMPTS = 3
         result = None
 
-        with httpx.Client(timeout=30) as client:
-            while elapsed < max_wait:
-                time.sleep(poll_interval)
-                elapsed += poll_interval
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                logger.info(f"Retrying RunPod job (attempt {attempt}/{MAX_ATTEMPTS})...")
+                # Re-submit a new job
+                with httpx.Client(timeout=60) as client:
+                    resp = client.post(f"{base_url}/run", headers=headers, json=payload)
+                    resp.raise_for_status()
+                    job = resp.json()
+                job_id = job["id"]
+                logger.info(f"RunPod retry job submitted: {job_id}")
 
-                status_resp = client.get(
-                    f"{base_url}/status/{job_id}", headers=headers
-                )
-                status_resp.raise_for_status()
-                status_data = status_resp.json()
-                job_status = status_data.get("status")
+            poll_interval = 5
+            max_wait = 600  # 10 minutes
+            elapsed = 0
+            result = None
+            job_failed = False
 
-                if job_status == "COMPLETED":
-                    result = status_data.get("output", {})
-                    break
-                elif job_status == "FAILED":
-                    error = status_data.get("error", "RunPod job failed")
-                    raise RuntimeError(error)
-                elif job_status == "IN_PROGRESS":
-                    run_async(update_status(AnalysisStatus.ANALYZING_CONTENT, 60))
-                # else still IN_QUEUE
+            with httpx.Client(timeout=30) as client:
+                while elapsed < max_wait:
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
 
-                if elapsed % 30 == 0:
-                    logger.info(f"RunPod job {job_id}: {job_status} ({elapsed}s)")
+                    status_resp = client.get(
+                        f"{base_url}/status/{job_id}", headers=headers
+                    )
+                    status_resp.raise_for_status()
+                    status_data = status_resp.json()
+                    job_status = status_data.get("status")
 
-        if result is None:
-            raise TimeoutError(f"RunPod job {job_id} timed out after {max_wait}s")
+                    if job_status == "COMPLETED":
+                        result = status_data.get("output", {})
+                        break
+                    elif job_status == "FAILED":
+                        error = status_data.get("error", "RunPod job failed")
+                        if attempt < MAX_ATTEMPTS:
+                            logger.warning(f"RunPod job {job_id} failed (attempt {attempt}): {error}")
+                            job_failed = True
+                            break
+                        raise RuntimeError(error)
+                    elif job_status == "IN_PROGRESS":
+                        run_async(update_status(AnalysisStatus.ANALYZING_CONTENT, 60))
+                    # else still IN_QUEUE
 
-        if "error" in result:
-            raise RuntimeError(result["error"])
+                    if elapsed % 30 == 0:
+                        logger.info(f"RunPod job {job_id}: {job_status} ({elapsed}s)")
+
+            if job_failed:
+                continue
+
+            if result is None:
+                if attempt < MAX_ATTEMPTS:
+                    logger.warning(f"RunPod job {job_id} timed out (attempt {attempt}), retrying...")
+                    continue
+                raise TimeoutError(f"RunPod job {job_id} timed out after {max_wait}s")
+
+            if "error" in result:
+                if attempt < MAX_ATTEMPTS:
+                    logger.warning(f"RunPod job {job_id} returned error (attempt {attempt}): {result['error']}")
+                    continue
+                raise RuntimeError(result["error"])
+
+            # Check if transcription is empty for a video with audio (stale worker)
+            transcription_check = result.get("transcription", {})
+            transcript_text_check = ""
+            if isinstance(transcription_check, dict):
+                transcript_text_check = transcription_check.get("text", "")
+            if not transcript_text_check and not is_audio_only:
+                if attempt < MAX_ATTEMPTS:
+                    logger.warning(f"RunPod job {job_id} returned empty transcription (attempt {attempt}), retrying...")
+                    continue
+                logger.warning("All retry attempts returned empty transcription")
+
+            break  # Success
 
         logger.info(f"RunPod job {job_id} completed. Saving results to DB...")
         run_async(update_status(AnalysisStatus.GENERATING_REPORT, 90))
 
         # Extract results from RunPod response
-        report = result.get("report", {})
         transcription = result.get("transcription", {})
         voice = result.get("voice_analysis", {})
         facial = result.get("facial_analysis", {})
@@ -202,8 +242,40 @@ def _run_via_runpod(
         content = result.get("content_analysis", {})
         timings = result.get("timings", {})
 
-        # The RunPod handler returns raw analysis results in the report.
-        # We need to save each sub-analysis and the report to DB.
+        # Run comparison against golden pitch deck locally (lightweight, no GPU)
+        comparison_result = None
+        actual_golden_id = None
+        golden_reference = run_async(_get_golden_pitch_deck_reference(None))
+        if golden_reference and golden_reference.get("is_processed"):
+            actual_golden_id = golden_reference.get("id")
+            logger.info(f"Comparing against golden pitch deck: {actual_golden_id}")
+            transcript_text = transcription.get("text", "")
+            comparison_result = _run_comparison_sync(
+                golden_reference=golden_reference,
+                transcript=transcript_text,
+                voice_result=voice,
+                pose_result=pose,
+                facial_result=facial,
+                content_result=content,
+            )
+            logger.info(f"Comparison completed: {comparison_result.get('summary', {}).get('overall_comparison_score', 'N/A')}")
+        else:
+            logger.info("No processed golden pitch deck available for comparison")
+
+        # Generate report locally with comparison data
+        from app.analyzers.report_generator import ReportGenerator
+        report_gen = ReportGenerator()
+        report = report_gen.generate({
+            "voice": voice,
+            "facial": facial,
+            "pose": pose,
+            "content": content,
+            "has_audio": not is_audio_only,
+            "comparison": comparison_result,
+            "golden_pitch_deck_id": actual_golden_id,
+        })
+
+        # Save each sub-analysis and the report to DB.
         async def save_results():
             async with async_session_maker() as session:
                 # Transcription
@@ -274,7 +346,7 @@ def _run_via_runpod(
                     llm_feedback=content.get("llm_feedback"),
                 ))
 
-                # Report
+                # Report (with comparison data)
                 session.add(AnalysisReport(
                     analysis_id=analysis_id,
                     overall_score=report.get("overall_score", 50.0),
@@ -287,6 +359,18 @@ def _run_via_runpod(
                     improvements=report.get("improvements"),
                     timestamped_issues=report.get("timestamped_issues"),
                     recommendations=report.get("recommendations"),
+                    golden_pitch_deck_id=report.get("golden_pitch_deck_id"),
+                    comparison_overall_score=report.get("comparison_overall_score"),
+                    content_similarity_score=report.get("content_similarity_score"),
+                    keyword_coverage_score=report.get("keyword_coverage_score"),
+                    voice_similarity_score=report.get("voice_similarity_score"),
+                    pose_similarity_score=report.get("pose_similarity_score"),
+                    facial_similarity_score=report.get("facial_similarity_score"),
+                    keyword_comparison=report.get("keyword_comparison"),
+                    content_comparison=report.get("content_comparison"),
+                    pose_comparison=report.get("pose_comparison"),
+                    voice_comparison=report.get("voice_comparison"),
+                    facial_comparison=report.get("facial_comparison"),
                 ))
 
                 await session.commit()

@@ -111,30 +111,69 @@ def _process_golden_via_runpod(
         job_id = job["id"]
         logger.info(f"RunPod golden pitch job: {job_id}")
 
-        # Poll for completion
-        max_wait = 600
-        elapsed = 0
+        # Poll with retry logic for stale-worker failures
+        MAX_ATTEMPTS = 3
         result = None
 
-        with httpx.Client(timeout=30) as client:
-            while elapsed < max_wait:
-                time.sleep(5)
-                elapsed += 5
-                status_resp = client.get(f"{base_url}/status/{job_id}", headers=headers)
-                status_resp.raise_for_status()
-                data = status_resp.json()
-                status = data.get("status")
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                logger.info(f"Retrying RunPod golden pitch job (attempt {attempt}/{MAX_ATTEMPTS})...")
+                with httpx.Client(timeout=60) as client:
+                    resp = client.post(f"{base_url}/run", headers=headers, json=payload)
+                    resp.raise_for_status()
+                    job = resp.json()
+                job_id = job["id"]
+                logger.info(f"RunPod golden pitch retry job: {job_id}")
 
-                if status == "COMPLETED":
-                    result = data.get("output", {})
-                    break
-                elif status == "FAILED":
-                    raise RuntimeError(data.get("error", "RunPod job failed"))
+            max_wait = 600
+            elapsed = 0
+            result = None
+            job_failed = False
 
-        if result is None:
-            raise TimeoutError(f"RunPod job timed out after {max_wait}s")
-        if "error" in result:
-            raise RuntimeError(result["error"])
+            with httpx.Client(timeout=30) as client:
+                while elapsed < max_wait:
+                    time.sleep(5)
+                    elapsed += 5
+                    status_resp = client.get(f"{base_url}/status/{job_id}", headers=headers)
+                    status_resp.raise_for_status()
+                    data = status_resp.json()
+                    status = data.get("status")
+
+                    if status == "COMPLETED":
+                        result = data.get("output", {})
+                        break
+                    elif status == "FAILED":
+                        error = data.get("error", "RunPod job failed")
+                        if attempt < MAX_ATTEMPTS:
+                            logger.warning(f"RunPod golden pitch job {job_id} failed (attempt {attempt}): {error}")
+                            job_failed = True
+                            break
+                        raise RuntimeError(error)
+
+            if job_failed:
+                continue
+
+            if result is None:
+                if attempt < MAX_ATTEMPTS:
+                    logger.warning(f"RunPod golden pitch job {job_id} timed out (attempt {attempt}), retrying...")
+                    continue
+                raise TimeoutError(f"RunPod job timed out after {max_wait}s")
+
+            if "error" in result:
+                if attempt < MAX_ATTEMPTS:
+                    logger.warning(f"RunPod golden pitch job {job_id} error (attempt {attempt}): {result['error']}")
+                    continue
+                raise RuntimeError(result["error"])
+
+            # Verify transcription isn't empty (stale worker symptom)
+            t_check = result.get("transcription", {})
+            if isinstance(t_check, dict) and not t_check.get("text", ""):
+                if attempt < MAX_ATTEMPTS:
+                    logger.warning(f"RunPod golden pitch job {job_id} empty transcription (attempt {attempt}), retrying...")
+                    continue
+                logger.warning("All retry attempts returned empty transcription for golden pitch")
+
+            break  # Success
 
         # Extract reference data from RunPod results
         transcription = result.get("transcription", {})

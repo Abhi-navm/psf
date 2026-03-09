@@ -335,6 +335,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     elif name == "pose":
                         pose_result = res
                 except Exception as e:
+                    # Transcription failures on audio videos are critical
+                    # (e.g. CUDA PTX mismatch on stale workers) — fail the
+                    # job so RunPod retries on a different worker.
+                    if name == "transcription" and has_audio:
+                        raise RuntimeError(
+                            f"Transcription failed (likely stale worker): {e}"
+                        ) from e
                     timings[name] = f"error: {e}"
 
         timings["phase2_total"] = round(time.time() - t0, 2)

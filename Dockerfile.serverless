@@ -61,8 +61,10 @@ from sentence_transformers import SentenceTransformer; \
 SentenceTransformer('all-MiniLM-L6-v2'); \
 print('SentenceTransformer cached')" \
     && python3.11 -c "\
+import numpy as np; \
 from deepface import DeepFace; \
-DeepFace.analyze(img_path='https://raw.githubusercontent.com/serengil/deepface/master/tests/dataset/img1.jpg', actions=['emotion'], enforce_detection=False, silent=True); \
+img = np.zeros((100, 100, 3), dtype=np.uint8); \
+DeepFace.analyze(img_path=img, actions=['emotion'], enforce_detection=False, silent=True); \
 print('DeepFace models cached')" || true
 # Now enable offline mode so runtime doesn't hit the network
 ENV HF_HUB_OFFLINE=1 \

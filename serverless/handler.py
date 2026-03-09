@@ -379,6 +379,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "segments": transcription_result.get("segments", []),
                 "language": transcription_result.get("language", "en"),
             },
+            "voice_analysis": voice_result,
+            "facial_analysis": facial_result,
+            "pose_analysis": pose_result,
+            "content_analysis": content_result,
             "timings": timings,
         }
 

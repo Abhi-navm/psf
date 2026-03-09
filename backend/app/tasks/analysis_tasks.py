@@ -5,23 +5,40 @@ Main analysis orchestration tasks.
 import os
 import asyncio
 import time
+import logging as _logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
-from celery import shared_task
-from celery.utils.log import get_task_logger
-
 from app.core.config import settings
 
-logger = get_task_logger(__name__)
+# Use standard logging when running without Celery
+logger = _logging.getLogger(__name__)
+logger.setLevel(_logging.INFO)
 
-# Also log to file so we can inspect phase timings
-import logging as _logging
+# Log to file
+os.makedirs("logs", exist_ok=True)
 _file_handler = _logging.FileHandler("logs/celery_worker.log")
 _file_handler.setFormatter(_logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(_file_handler)
+
+# Add stream handler for console output
+if not any(isinstance(h, _logging.StreamHandler) for h in logger.handlers):
+    logger.addHandler(_logging.StreamHandler())
+
+# Celery decorator — only import if not in RunPod-only mode
+def _noop_task(bind=True, max_retries=2):
+    """No-op decorator when Celery is not available."""
+    def wrapper(func):
+        func.delay = lambda *a, **kw: None
+        return func
+    return wrapper
+
+try:
+    from celery import shared_task
+except ImportError:
+    shared_task = _noop_task
 
 
 def get_or_create_event_loop():
@@ -41,6 +58,263 @@ def run_async(coro):
     """Run async function in sync context."""
     loop = get_or_create_event_loop()
     return loop.run_until_complete(coro)
+
+
+def _upload_to_temp_host(file_path: str) -> str:
+    """Upload a file to a temporary file host and return the download URL."""
+    import httpx
+
+    logger.info(f"Uploading {file_path} to temp file host...")
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+
+    with httpx.Client(timeout=600, follow_redirects=True) as client:
+        with open(file_path, "rb") as f:
+            resp = client.post(
+                "https://tmpfiles.org/api/v1/upload",
+                files={"file": (os.path.basename(file_path), f, "video/mp4")},
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != "success":
+            raise RuntimeError(f"tmpfiles.org upload failed: {data}")
+        # Convert page URL to direct download URL
+        page_url = data["data"]["url"]
+        dl_url = page_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+        logger.info(f"Uploaded {file_size_mb:.1f}MB -> {dl_url}")
+        return dl_url
+
+
+def _run_via_runpod(
+    analysis_id: str,
+    video_id: str,
+    video_path: str,
+    is_audio_only: bool = False,
+) -> Dict[str, Any]:
+    """
+    Proxy the analysis to the RunPod serverless endpoint.
+    Base64-encodes the video, sends to RunPod, polls for results,
+    and saves them into the local DB so the frontend can display them.
+    """
+    import base64
+    import httpx
+    from app.db.database import async_session_maker
+    from app.db.models import (
+        Analysis, AnalysisStatus, Transcription, VoiceAnalysis,
+        FacialAnalysis, PoseAnalysis, ContentAnalysis, AnalysisReport,
+    )
+
+    base_url = f"https://api.runpod.ai/v2/{settings.runpod_endpoint_id}"
+    headers = {
+        "Authorization": f"Bearer {settings.runpod_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    async def update_status(status: AnalysisStatus, progress: int = 0):
+        async with async_session_maker() as session:
+            from sqlalchemy import update
+            stmt = update(Analysis).where(Analysis.id == analysis_id).values(
+                status=status, progress=progress, updated_at=datetime.utcnow(),
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    async def mark_failed(error_msg: str):
+        async with async_session_maker() as session:
+            from sqlalchemy import update
+            stmt = update(Analysis).where(Analysis.id == analysis_id).values(
+                status=AnalysisStatus.FAILED,
+                error_message=error_msg,
+                updated_at=datetime.utcnow(),
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    try:
+        run_async(update_status(AnalysisStatus.PROCESSING, 5))
+
+        # Upload video to temp file host (RunPod has 10MB request body limit)
+        video_url = _upload_to_temp_host(video_path)
+
+        run_async(update_status(AnalysisStatus.PROCESSING, 10))
+
+        # Submit to RunPod (async /run endpoint)
+        payload = {
+            "input": {
+                "video_url": video_url,
+                "is_audio_only": is_audio_only,
+            }
+        }
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(f"{base_url}/run", headers=headers, json=payload)
+            resp.raise_for_status()
+            job = resp.json()
+
+        job_id = job["id"]
+        logger.info(f"RunPod job submitted: {job_id}")
+        run_async(update_status(AnalysisStatus.TRANSCRIBING, 25))
+
+        # Poll for completion
+        poll_interval = 5
+        max_wait = 600  # 10 minutes
+        elapsed = 0
+        result = None
+
+        with httpx.Client(timeout=30) as client:
+            while elapsed < max_wait:
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+
+                status_resp = client.get(
+                    f"{base_url}/status/{job_id}", headers=headers
+                )
+                status_resp.raise_for_status()
+                status_data = status_resp.json()
+                job_status = status_data.get("status")
+
+                if job_status == "COMPLETED":
+                    result = status_data.get("output", {})
+                    break
+                elif job_status == "FAILED":
+                    error = status_data.get("error", "RunPod job failed")
+                    raise RuntimeError(error)
+                elif job_status == "IN_PROGRESS":
+                    run_async(update_status(AnalysisStatus.ANALYZING_CONTENT, 60))
+                # else still IN_QUEUE
+
+                if elapsed % 30 == 0:
+                    logger.info(f"RunPod job {job_id}: {job_status} ({elapsed}s)")
+
+        if result is None:
+            raise TimeoutError(f"RunPod job {job_id} timed out after {max_wait}s")
+
+        if "error" in result:
+            raise RuntimeError(result["error"])
+
+        logger.info(f"RunPod job {job_id} completed. Saving results to DB...")
+        run_async(update_status(AnalysisStatus.GENERATING_REPORT, 90))
+
+        # Extract results from RunPod response
+        report = result.get("report", {})
+        transcription = result.get("transcription", {})
+        voice = result.get("voice_analysis", {})
+        facial = result.get("facial_analysis", {})
+        pose = result.get("pose_analysis", {})
+        content = result.get("content_analysis", {})
+        timings = result.get("timings", {})
+
+        # The RunPod handler returns raw analysis results in the report.
+        # We need to save each sub-analysis and the report to DB.
+        async def save_results():
+            async with async_session_maker() as session:
+                # Transcription
+                session.add(Transcription(
+                    analysis_id=analysis_id,
+                    full_text=transcription.get("text", ""),
+                    language=transcription.get("language", "en"),
+                    confidence=0.0,
+                    segments=transcription.get("segments"),
+                ))
+
+                # Voice analysis - use detailed per-metric scores
+                session.add(VoiceAnalysis(
+                    analysis_id=analysis_id,
+                    overall_score=voice.get("overall_score", report.get("voice_score", 50.0)),
+                    energy_score=voice.get("energy_score", 50.0),
+                    clarity_score=voice.get("clarity_score", 50.0),
+                    pace_score=voice.get("pace_score", 50.0),
+                    confidence_score=voice.get("confidence_score", 50.0),
+                    tone_score=voice.get("tone_score", 50.0),
+                    avg_pitch=voice.get("avg_pitch"),
+                    pitch_variance=voice.get("pitch_variance"),
+                    speaking_rate_wpm=voice.get("speaking_rate_wpm"),
+                    pause_frequency=voice.get("pause_frequency"),
+                    emotion_timeline=voice.get("emotion_timeline"),
+                    issues=voice.get("issues"),
+                ))
+
+                # Facial analysis
+                session.add(FacialAnalysis(
+                    analysis_id=analysis_id,
+                    overall_score=facial.get("overall_score", report.get("facial_score", 50.0)),
+                    positivity_score=facial.get("positivity_score", 50.0),
+                    engagement_score=facial.get("engagement_score", 50.0),
+                    confidence_score=facial.get("confidence_score", 50.0),
+                    emotion_distribution=facial.get("emotion_distribution"),
+                    emotion_timeline=facial.get("emotion_timeline"),
+                    eye_contact_percentage=facial.get("eye_contact_percentage"),
+                    issues=facial.get("issues"),
+                ))
+
+                # Pose analysis
+                session.add(PoseAnalysis(
+                    analysis_id=analysis_id,
+                    overall_score=pose.get("overall_score", report.get("pose_score", 50.0)),
+                    posture_score=pose.get("posture_score", 50.0),
+                    gesture_score=pose.get("gesture_score", 50.0),
+                    movement_score=pose.get("movement_score", 50.0),
+                    avg_shoulder_alignment=pose.get("avg_shoulder_alignment"),
+                    fidgeting_frequency=pose.get("fidgeting_frequency"),
+                    gesture_frequency=pose.get("gesture_frequency"),
+                    pose_timeline=pose.get("pose_timeline"),
+                    issues=pose.get("issues"),
+                ))
+
+                # Content analysis
+                session.add(ContentAnalysis(
+                    analysis_id=analysis_id,
+                    overall_score=content.get("overall_score", report.get("content_score", 50.0)),
+                    clarity_score=content.get("clarity_score", 50.0),
+                    persuasion_score=content.get("persuasion_score", 50.0),
+                    structure_score=content.get("structure_score", 50.0),
+                    filler_words=content.get("filler_words"),
+                    filler_word_count=content.get("filler_word_count", 0),
+                    weak_phrases=content.get("weak_phrases"),
+                    negative_language=content.get("negative_language"),
+                    key_points=content.get("key_points"),
+                    llm_feedback=content.get("llm_feedback"),
+                ))
+
+                # Report
+                session.add(AnalysisReport(
+                    analysis_id=analysis_id,
+                    overall_score=report.get("overall_score", 50.0),
+                    voice_score=report.get("voice_score", 50.0),
+                    facial_score=report.get("facial_score", 50.0),
+                    pose_score=report.get("pose_score", 50.0),
+                    content_score=report.get("content_score", 50.0),
+                    executive_summary=report.get("executive_summary", "Analysis completed."),
+                    strengths=report.get("strengths"),
+                    improvements=report.get("improvements"),
+                    timestamped_issues=report.get("timestamped_issues"),
+                    recommendations=report.get("recommendations"),
+                ))
+
+                await session.commit()
+
+        run_async(save_results())
+
+        # Mark completed
+        async def mark_completed():
+            async with async_session_maker() as session:
+                from sqlalchemy import update
+                stmt = update(Analysis).where(Analysis.id == analysis_id).values(
+                    status=AnalysisStatus.COMPLETED,
+                    progress=100,
+                    completed_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                )
+                await session.execute(stmt)
+                await session.commit()
+
+        run_async(mark_completed())
+        logger.info(f"RunPod analysis {analysis_id} saved. Timings: {timings}")
+
+        return {"success": True, "analysis_id": analysis_id, "report": report}
+
+    except Exception as e:
+        logger.error(f"RunPod analysis {analysis_id} failed: {e}")
+        run_async(mark_failed(str(e)))
+        raise
 
 
 @shared_task(bind=True, max_retries=2)
@@ -66,6 +340,11 @@ def run_full_analysis(
         
     All operations are run directly (not as subtasks) to avoid Celery restrictions.
     """
+    # If RunPod is configured, delegate to serverless endpoint
+    if settings.runpod_endpoint_id and settings.runpod_api_key:
+        logger.info(f"RunPod proxy mode: delegating analysis {analysis_id} to endpoint {settings.runpod_endpoint_id}")
+        return _run_via_runpod(analysis_id, video_id, video_path, is_audio_only)
+
     from app.db.database import async_session_maker
     from app.db.models import Analysis, AnalysisStatus
     

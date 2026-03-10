@@ -1,7 +1,7 @@
 # RunPod Serverless Dockerfile
 # Optimized for pay-per-second GPU inference
 
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -42,14 +42,14 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --upgrade pip && pip install "setuptools<82"
 
 # PyTorch + CUDA
-RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu126
 
 # Install backend requirements
 COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
-# Fix CuDNN version: TensorFlow needs CuDNN 9.3+ but base image ships 9.1
-RUN pip install --no-cache-dir nvidia-cudnn-cu12==9.3.0.75
+# Ensure CuDNN 9.x is available (CUDA 12.6 base includes it, pip package as fallback)
+RUN pip install --no-cache-dir nvidia-cudnn-cu12
 ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.11/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 
 # Install runpod SDK

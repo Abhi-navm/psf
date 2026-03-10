@@ -98,17 +98,35 @@ def _download_video(url: str, dest: str) -> str:
 
 
 def _extract_audio(video_path: str, output_path: str) -> Dict[str, Any]:
-    from moviepy.editor import VideoFileClip
-    video = VideoFileClip(video_path)
-    audio = video.audio
-    if audio is None:
-        video.close()
-        return {"success": False, "error": "No audio track"}
-    audio.write_audiofile(output_path, fps=16000, nbytes=2,
-                          codec="pcm_s16le", verbose=False, logger=None)
-    duration = video.duration
-    video.close()
-    return {"success": True, "duration": duration}
+    try:
+        from moviepy.editor import AudioFileClip
+        audio = AudioFileClip(video_path)
+        audio.write_audiofile(output_path, fps=16000, nbytes=2,
+                              codec="pcm_s16le", verbose=False, logger=None)
+        duration = audio.duration
+        audio.close()
+        return {"success": True, "duration": duration}
+    except Exception as e:
+        # Fallback: try ffmpeg directly if moviepy can't parse the file
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", video_path, "-vn",
+                 "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", output_path],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0 and os.path.exists(output_path):
+                # Get duration via ffprobe
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+                    capture_output=True, text=True, timeout=30,
+                )
+                dur = float(probe.stdout.strip()) if probe.stdout.strip() else 0
+                return {"success": True, "duration": dur}
+            return {"success": False, "error": f"ffmpeg failed: {result.stderr[:200]}"}
+        except Exception as e2:
+            return {"success": False, "error": f"Audio extraction failed: {e}; ffmpeg fallback: {e2}"}
 
 
 def _extract_frames(video_path: str, output_dir: str, fps: float = 0.3) -> list:

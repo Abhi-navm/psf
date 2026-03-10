@@ -2,6 +2,7 @@
 Analysis endpoints for starting, monitoring, and retrieving results.
 """
 
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -11,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.core.logging import logger
+from app.core.config import settings
 from app.db.database import get_db
 from app.db.models import (
     Video,
@@ -116,19 +118,37 @@ async def start_analysis(
     await db.commit()
     await db.refresh(analysis)
     
-    # Queue Celery task with comparison parameters
-    task = run_full_analysis.delay(
-        analysis_id=analysis.id,
-        video_id=video_id,
-        video_path=video.file_path,
-        golden_pitch_deck_id=request.golden_pitch_deck_id,
-        skip_comparison=request.skip_comparison,
-        is_audio_only=video.is_audio_only if hasattr(video, 'is_audio_only') else False,
-    )
-    
-    # Update with task ID
-    analysis.celery_task_id = task.id
-    await db.commit()
+    # Dispatch analysis
+    if settings.runpod_endpoint_id and settings.runpod_api_key:
+        from app.tasks.analysis_tasks import _run_via_runpod
+
+        def _bg():
+            try:
+                _run_via_runpod(
+                    analysis_id=analysis.id,
+                    video_id=video_id,
+                    video_path=video.file_path,
+                    is_audio_only=video.is_audio_only if hasattr(video, 'is_audio_only') else False,
+                )
+            except Exception as e:
+                logger.error(f"RunPod background thread failed: {e}")
+
+        t = threading.Thread(target=_bg, daemon=True)
+        t.start()
+        logger.info(f"Analysis {analysis.id} dispatched to RunPod (background thread)")
+    else:
+        # Queue Celery task with comparison parameters
+        task = run_full_analysis.delay(
+            analysis_id=analysis.id,
+            video_id=video_id,
+            video_path=video.file_path,
+            golden_pitch_deck_id=request.golden_pitch_deck_id,
+            skip_comparison=request.skip_comparison,
+            is_audio_only=video.is_audio_only if hasattr(video, 'is_audio_only') else False,
+        )
+        # Update with task ID
+        analysis.celery_task_id = task.id
+        await db.commit()
     
     logger.info(f"Analysis started: {analysis.id} for video {video_id}")
     

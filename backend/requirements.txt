@@ -18,7 +18,8 @@ alembic==1.13.1
 aiosqlite==0.19.0
 
 # AI/ML - Transcription (torch installed separately in Dockerfile)
-faster-whisper>=1.0.0
+ctranslate2==4.5.0
+faster-whisper>=1.0.0,<1.1.0
 
 # AI/ML - Voice Analysis
 librosa==0.10.2

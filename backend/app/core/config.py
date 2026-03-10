@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:5173", "*"]
     
+    # RunPod
+    runpod_endpoint_id: str = ""
+    runpod_api_key: str = ""
+    use_runpod: bool = False  # Set True to use RunPod instead of local/Celery
+    
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v):

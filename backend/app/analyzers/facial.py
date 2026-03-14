@@ -104,6 +104,25 @@ class FacialExpressionAnalyzer:
         else:
             emotion_distribution = {}
         
+        # Safety check: if face detected in very few frames, treat as no person
+        face_detection_ratio = face_detected_count / total_frames if total_frames > 0 else 0
+        if face_detection_ratio < 0.1:  # Less than 10% of frames had a face
+            logger.warning(f"Face detected in only {face_detection_ratio:.0%} of frames — treating as no person")
+            return {
+                "skipped": True,
+                "reason": f"Face detected in only {face_detected_count}/{total_frames} frames",
+                "overall_score": 0,
+                "positivity_score": 0,
+                "engagement_score": 0,
+                "confidence_score": 0,
+                "emotion_distribution": {},
+                "emotion_timeline": [],
+                "eye_contact_percentage": 0,
+                "issues": [],
+                "frames_analyzed": face_detected_count,
+                "total_frames": total_frames,
+            }
+        
         # Calculate scores
         scores = self._calculate_scores(emotion_distribution, face_detected_count, total_frames)
         
@@ -129,7 +148,7 @@ class FacialExpressionAnalyzer:
             result = self.analyzer.analyze(
                 frame_path,
                 actions=["emotion"],
-                enforce_detection=False,
+                enforce_detection=True,
                 silent=True,
             )
             

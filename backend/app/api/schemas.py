@@ -47,6 +47,7 @@ class VideoResponse(VideoBase):
     file_path: str
     file_size: int
     mime_type: str
+    user_id: Optional[str] = None
     duration: Optional[float] = None
     width: Optional[int] = None
     height: Optional[int] = None
@@ -90,8 +91,9 @@ class VideoListResponse(BaseModel):
 class AnalysisCreate(BaseModel):
     """Schema for starting analysis."""
     video_id: str
+    user_id: Optional[str] = None
     # Optional: specify which golden pitch deck to compare against
-    # If not provided, uses the active golden pitch deck
+    # If not provided, uses the active golden pitch deck for this user
     golden_pitch_deck_id: Optional[str] = None
     # If True, skip comparison even if golden pitch deck exists
     skip_comparison: bool = False
@@ -105,6 +107,8 @@ class AnalysisStatusResponse(BaseModel):
     video_id: str
     status: AnalysisStatusEnum
     progress: int = Field(ge=0, le=100)
+    golden_pitch_deck_id: Optional[str] = None
+    skip_comparison: bool = False
     error_message: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -259,6 +263,7 @@ class GoldenPitchDeckCreate(BaseModel):
     video_id: str
     name: str = Field(min_length=1, max_length=255)
     description: Optional[str] = None
+    user_id: Optional[str] = None
     set_as_active: bool = True
 
 
@@ -277,6 +282,7 @@ class GoldenPitchDeckResponse(BaseModel):
     name: str
     description: Optional[str] = None
     video_id: str
+    user_id: Optional[str] = None
     is_active: bool
     is_processed: bool
     processing_error: Optional[str] = None

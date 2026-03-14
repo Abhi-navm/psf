@@ -1,0 +1,33 @@
+# Serverless-only requirements (no web framework, task queue, or database)
+
+# Core config
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+
+# AI/ML - Transcription (torch installed separately)
+ctranslate2==4.5.0
+faster-whisper>=1.0.0,<1.1.0
+
+# AI/ML - Voice Analysis
+librosa==0.10.2
+soundfile==0.12.1
+
+# AI/ML - Facial Analysis
+deepface==0.0.93
+opencv-python-headless>=4.9.0
+tf-keras>=2.18.0
+
+# AI/ML - Body Pose
+mediapipe>=0.10.14
+
+# AI/ML - Semantic Similarity
+sentence-transformers>=2.2.0
+
+# Video Processing
+moviepy==1.0.3
+
+# Utils
+python-dotenv==1.0.0
+httpx>=0.25.0
+numpy==1.26.4
+loguru==0.7.2

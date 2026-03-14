@@ -1,0 +1,27 @@
+# FastAPI & Web
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+
+# Database
+sqlalchemy==2.0.25
+aiosqlite==0.19.0
+
+# HTTP client (for RunPod API calls)
+httpx>=0.25.0
+
+# Video metadata extraction (duration, resolution on upload)
+moviepy==1.0.3
+ffmpeg-python==0.2.0
+
+# Comparison analysis (sentence-transformers pulls in CPU torch ~300MB)
+sentence-transformers>=2.2.0
+
+# LLM for semantic keywords in comparison
+groq>=0.4.0
+
+# Utils
+python-dotenv==1.0.0
+aiofiles==23.2.1

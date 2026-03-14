@@ -152,17 +152,21 @@ def _extract_frames(video_path: str, output_dir: str, fps: float = 0.3) -> list:
 
 
 def _detect_and_crop_face_region(frames, analysis_dir):
-    """Detect face region and return cropped frames if webcam overlay."""
+    """Detect face region and return (frames, has_face). Crops if webcam overlay."""
     try:
         from app.analyzers.face_region import FaceRegionDetector
         detector = FaceRegionDetector()
         info = detector.detect_face_region(frames)
+        has_face = info.get("has_face", False)
+        if not has_face:
+            return frames, False
         if info.get("is_overlay") and info.get("crop_region"):
             cropped_dir = str(Path(analysis_dir) / "cropped_frames")
-            return detector.create_cropped_frames(frames, info["crop_region"], cropped_dir)
+            return detector.create_cropped_frames(frames, info["crop_region"], cropped_dir), True
+        return frames, True
     except Exception:
         pass
-    return frames
+    return frames, True  # assume face on error to avoid skipping valid videos
 
 
 # ── Analysis wrappers (no DB writes) ─────────────────────────────────
@@ -307,8 +311,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         has_audio = audio_result.get("success", False)
 
         # Face region detection / cropping
+        face_detected = False
         if raw_frames:
-            person_frames = _detect_and_crop_face_region(raw_frames, work_dir)
+            person_frames, face_detected = _detect_and_crop_face_region(raw_frames, work_dir)
         else:
             person_frames = []
 
@@ -334,9 +339,12 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             if has_audio:
                 futures["transcription"] = pool.submit(_transcribe, audio_path)
                 futures["voice"] = pool.submit(_analyze_voice, audio_path)
-            if not is_audio_only and sampled:
+            if not is_audio_only and sampled and face_detected:
                 futures["facial"] = pool.submit(_analyze_facial, sampled)
                 futures["pose"] = pool.submit(_analyze_pose, sampled)
+            elif not is_audio_only and not face_detected:
+                facial_result = {"skipped": True, "reason": "No face/person detected in video", "overall_score": 0}
+                pose_result = {"skipped": True, "reason": "No face/person detected in video", "overall_score": 0}
 
             for name, fut in futures.items():
                 try:

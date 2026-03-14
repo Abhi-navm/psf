@@ -51,6 +51,7 @@ class Video(Base):
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=generate_uuid
     )
+    user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_path: Mapped[str] = mapped_column(String(512), nullable=False)
@@ -83,6 +84,7 @@ class Analysis(Base):
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=generate_uuid
     )
+    user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     video_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False
     )
@@ -91,6 +93,10 @@ class Analysis(Base):
     )
     progress: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # 0-100
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Comparison tracking
+    golden_pitch_deck_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    skip_comparison: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     
     # Task tracking
     celery_task_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
@@ -322,6 +328,7 @@ class GoldenPitchDeck(Base):
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=generate_uuid
     )
+    user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     

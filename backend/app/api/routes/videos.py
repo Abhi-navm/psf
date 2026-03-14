@@ -23,6 +23,7 @@ from app.core.exceptions import (
 from app.db.database import get_db
 from app.db.models import Video, Analysis, AnalysisReport, AnalysisStatus
 from app.api.schemas import VideoResponse, VideoListResponse, VideoWithAnalysisResponse, ErrorResponse
+from app.api.dependencies import get_user_id
 
 router = APIRouter(prefix="/videos", tags=["videos"])
 
@@ -75,6 +76,7 @@ def get_upload_path() -> Path:
 async def upload_video(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """
     Upload a video file for analysis.
@@ -161,6 +163,7 @@ async def upload_video(
             file_path=str(file_path),
             file_size=file_size,
             mime_type=content_type,
+            user_id=user_id,
             duration=metadata.get("duration"),
             width=metadata.get("width") if not is_audio_only else None,
             height=metadata.get("height") if not is_audio_only else None,
@@ -213,17 +216,25 @@ async def list_videos(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """List all uploaded videos with pagination and analysis info."""
     offset = (page - 1) * page_size
     
+    # Build base filter
+    base_filter = select(Video)
+    count_filter = select(func.count(Video.id))
+    if user_id:
+        base_filter = base_filter.where(Video.user_id == user_id)
+        count_filter = count_filter.where(Video.user_id == user_id)
+    
     # Get total count
-    count_result = await db.execute(select(func.count(Video.id)))
+    count_result = await db.execute(count_filter)
     total = count_result.scalar() or 0
     
     # Get videos
     result = await db.execute(
-        select(Video)
+        base_filter
         .order_by(Video.created_at.desc())
         .offset(offset)
         .limit(page_size)
@@ -290,9 +301,13 @@ async def list_videos(
 async def get_video(
     video_id: str,
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """Get video details by ID."""
-    result = await db.execute(select(Video).where(Video.id == video_id))
+    query = select(Video).where(Video.id == video_id)
+    if user_id:
+        query = query.where(Video.user_id == user_id)
+    result = await db.execute(query)
     video = result.scalar_one_or_none()
     
     if not video:
@@ -311,9 +326,13 @@ async def get_video(
 async def delete_video(
     video_id: str,
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """Delete a video and its associated analyses."""
-    result = await db.execute(select(Video).where(Video.id == video_id))
+    query = select(Video).where(Video.id == video_id)
+    if user_id:
+        query = query.where(Video.user_id == user_id)
+    result = await db.execute(query)
     video = result.scalar_one_or_none()
     
     if not video:
@@ -342,9 +361,13 @@ async def delete_video(
 async def stream_video(
     video_id: str,
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """Stream a video file for playback."""
-    result = await db.execute(select(Video).where(Video.id == video_id))
+    query = select(Video).where(Video.id == video_id)
+    if user_id:
+        query = query.where(Video.user_id == user_id)
+    result = await db.execute(query)
     video = result.scalar_one_or_none()
 
     if not video:

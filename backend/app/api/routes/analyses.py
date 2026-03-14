@@ -38,6 +38,7 @@ from app.api.schemas import (
     ErrorResponse,
 )
 from app.tasks.analysis_tasks import run_full_analysis
+from app.api.dependencies import get_user_id
 
 router = APIRouter(prefix="/analyses", tags=["analyses"])
 
@@ -53,6 +54,7 @@ router = APIRouter(prefix="/analyses", tags=["analyses"])
 async def start_analysis(
     request: AnalysisCreate,
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """
     Start a new analysis for a video.
@@ -107,8 +109,12 @@ async def start_analysis(
         )
     
     # Create new analysis
+    effective_user_id = request.user_id or user_id
     analysis = Analysis(
         video_id=video_id,
+        user_id=effective_user_id,
+        golden_pitch_deck_id=request.golden_pitch_deck_id,
+        skip_comparison=request.skip_comparison,
         status=AnalysisStatus.PENDING,
         progress=0,
         started_at=datetime.utcnow(),
@@ -129,6 +135,8 @@ async def start_analysis(
                     video_id=video_id,
                     video_path=video.file_path,
                     is_audio_only=video.is_audio_only if hasattr(video, 'is_audio_only') else False,
+                    golden_pitch_deck_id=request.golden_pitch_deck_id,
+                    skip_comparison=request.skip_comparison,
                 )
             except Exception as e:
                 logger.error(f"RunPod background thread failed: {e}")

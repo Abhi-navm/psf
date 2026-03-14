@@ -21,6 +21,7 @@ from app.api.schemas import (
     GoldenPitchDeckListResponse,
     ErrorResponse,
 )
+from app.api.dependencies import get_user_id
 
 router = APIRouter(prefix="/golden-pitch-decks", tags=["golden-pitch-decks"])
 
@@ -36,6 +37,7 @@ router = APIRouter(prefix="/golden-pitch-decks", tags=["golden-pitch-decks"])
 async def create_golden_pitch_deck(
     request: GoldenPitchDeckCreate,
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """
     Create a new golden pitch deck from an uploaded video.
@@ -59,17 +61,20 @@ async def create_golden_pitch_deck(
             },
         )
     
-    # If setting as active, deactivate other golden pitch decks
+    # If setting as active, deactivate other golden pitch decks for this user
+    effective_user_id = request.user_id or user_id
     if request.set_as_active:
-        await db.execute(
-            update(GoldenPitchDeck).values(is_active=False)
-        )
+        deactivate_query = update(GoldenPitchDeck).values(is_active=False)
+        if effective_user_id:
+            deactivate_query = deactivate_query.where(GoldenPitchDeck.user_id == effective_user_id)
+        await db.execute(deactivate_query)
     
     # Create golden pitch deck record
     golden_deck = GoldenPitchDeck(
         video_id=request.video_id,
         name=request.name,
         description=request.description,
+        user_id=effective_user_id,
         is_active=request.set_as_active,
         is_processed=False,
     )
@@ -110,11 +115,15 @@ async def create_golden_pitch_deck(
 async def list_golden_pitch_decks(
     active_only: bool = Query(False, description="Only return active golden pitch decks"),
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """
     List all golden pitch decks.
     """
     query = select(GoldenPitchDeck).order_by(GoldenPitchDeck.created_at.desc())
+    
+    if user_id:
+        query = query.where(GoldenPitchDeck.user_id == user_id)
     
     if active_only:
         query = query.where(GoldenPitchDeck.is_active == True)
@@ -137,11 +146,15 @@ async def list_golden_pitch_decks(
 )
 async def get_active_golden_pitch_deck(
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """
     Get the currently active golden pitch deck.
     """
     query = select(GoldenPitchDeck).where(GoldenPitchDeck.is_active == True)
+    if user_id:
+        query = query.where(GoldenPitchDeck.user_id == user_id)
+    query = query.order_by(GoldenPitchDeck.created_at.desc()).limit(1)
     result = await db.execute(query)
     golden_deck = result.scalar_one_or_none()
     
@@ -167,11 +180,14 @@ async def get_active_golden_pitch_deck(
 async def get_golden_pitch_deck(
     golden_pitch_deck_id: str,
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """
     Get a specific golden pitch deck by ID.
     """
     query = select(GoldenPitchDeck).where(GoldenPitchDeck.id == golden_pitch_deck_id)
+    if user_id:
+        query = query.where(GoldenPitchDeck.user_id == user_id)
     result = await db.execute(query)
     golden_deck = result.scalar_one_or_none()
     
@@ -198,11 +214,14 @@ async def update_golden_pitch_deck(
     golden_pitch_deck_id: str,
     request: GoldenPitchDeckUpdate,
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """
     Update a golden pitch deck.
     """
     query = select(GoldenPitchDeck).where(GoldenPitchDeck.id == golden_pitch_deck_id)
+    if user_id:
+        query = query.where(GoldenPitchDeck.user_id == user_id)
     result = await db.execute(query)
     golden_deck = result.scalar_one_or_none()
     
@@ -215,13 +234,16 @@ async def update_golden_pitch_deck(
             },
         )
     
-    # If setting as active, deactivate others
+    # If setting as active, deactivate others for same user
     if request.is_active is True:
-        await db.execute(
-            update(GoldenPitchDeck).where(
-                GoldenPitchDeck.id != golden_pitch_deck_id
-            ).values(is_active=False)
+        deactivate_query = update(GoldenPitchDeck).where(
+            GoldenPitchDeck.id != golden_pitch_deck_id
         )
+        if golden_deck.user_id:
+            deactivate_query = deactivate_query.where(
+                GoldenPitchDeck.user_id == golden_deck.user_id
+            )
+        await db.execute(deactivate_query.values(is_active=False))
     
     # Update fields
     update_data = request.model_dump(exclude_unset=True)
@@ -246,11 +268,14 @@ async def update_golden_pitch_deck(
 async def delete_golden_pitch_deck(
     golden_pitch_deck_id: str,
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """
     Delete a golden pitch deck.
     """
     query = select(GoldenPitchDeck).where(GoldenPitchDeck.id == golden_pitch_deck_id)
+    if user_id:
+        query = query.where(GoldenPitchDeck.user_id == user_id)
     result = await db.execute(query)
     golden_deck = result.scalar_one_or_none()
     
@@ -279,11 +304,14 @@ async def delete_golden_pitch_deck(
 async def reprocess_golden_pitch_deck(
     golden_pitch_deck_id: str,
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """
     Reprocess a golden pitch deck to extract reference metrics.
     """
     query = select(GoldenPitchDeck).where(GoldenPitchDeck.id == golden_pitch_deck_id)
+    if user_id:
+        query = query.where(GoldenPitchDeck.user_id == user_id)
     result = await db.execute(query)
     golden_deck = result.scalar_one_or_none()
     
@@ -354,11 +382,14 @@ async def reprocess_golden_pitch_deck(
 async def set_active_golden_pitch_deck(
     golden_pitch_deck_id: str,
     db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_user_id),
 ):
     """
     Set a golden pitch deck as the active reference.
     """
     query = select(GoldenPitchDeck).where(GoldenPitchDeck.id == golden_pitch_deck_id)
+    if user_id:
+        query = query.where(GoldenPitchDeck.user_id == user_id)
     result = await db.execute(query)
     golden_deck = result.scalar_one_or_none()
     
@@ -371,12 +402,15 @@ async def set_active_golden_pitch_deck(
             },
         )
     
-    # Deactivate all other golden pitch decks
-    await db.execute(
-        update(GoldenPitchDeck).where(
-            GoldenPitchDeck.id != golden_pitch_deck_id
-        ).values(is_active=False)
+    # Deactivate all other golden pitch decks for this user
+    deactivate_query = update(GoldenPitchDeck).where(
+        GoldenPitchDeck.id != golden_pitch_deck_id
     )
+    if golden_deck.user_id:
+        deactivate_query = deactivate_query.where(
+            GoldenPitchDeck.user_id == golden_deck.user_id
+        )
+    await db.execute(deactivate_query.values(is_active=False))
     
     # Activate this one
     golden_deck.is_active = True

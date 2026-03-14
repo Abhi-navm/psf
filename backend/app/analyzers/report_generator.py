@@ -46,63 +46,52 @@ class ReportGenerator:
         # Check which analyses were skipped
         voice_skipped = voice.get("skipped", False)
         content_skipped = content.get("skipped", False)
+        facial_skipped = facial.get("skipped", False)
+        pose_skipped = pose.get("skipped", False)
         
         # Extract scores (use None for skipped analyses)
         voice_score = None if voice_skipped else voice.get("overall_score", 50)
-        facial_score = facial.get("overall_score", 50)
-        pose_score = pose.get("overall_score", 50)
+        facial_score = None if facial_skipped else facial.get("overall_score", 50)
+        pose_score = None if pose_skipped else pose.get("overall_score", 50)
         content_score = None if content_skipped else content.get("overall_score", 50)
         
-        # Calculate overall score with adjusted weights for missing analyses
-        if voice_skipped and content_skipped:
-            # Only visual analyses available
-            overall_score = (
-                facial_score * 0.5 +
-                pose_score * 0.5
+        # Calculate overall score from available (non-skipped) analyses only
+        available_scores = {}
+        if not voice_skipped and voice_score is not None:
+            available_scores["voice"] = voice_score
+        if not facial_skipped and facial_score is not None:
+            available_scores["facial"] = facial_score
+        if not pose_skipped and pose_score is not None:
+            available_scores["pose"] = pose_score
+        if not content_skipped and content_score is not None:
+            available_scores["content"] = content_score
+        
+        if available_scores:
+            total_weight = sum(self.CATEGORY_WEIGHTS[k] for k in available_scores)
+            overall_score = sum(
+                score * (self.CATEGORY_WEIGHTS[k] / total_weight)
+                for k, score in available_scores.items()
             )
-            voice_score_display = 0.0
-            content_score_display = 0.0
-        elif voice_skipped:
-            # No voice analysis
-            overall_score = (
-                facial_score * 0.30 +
-                pose_score * 0.30 +
-                content_score * 0.40
-            )
-            voice_score_display = 0.0
-            content_score_display = content_score
-        elif content_skipped:
-            # No content analysis
-            overall_score = (
-                voice_score * 0.35 +
-                facial_score * 0.35 +
-                pose_score * 0.30
-            )
-            voice_score_display = voice_score
-            content_score_display = 0.0
         else:
-            # All analyses available
-            overall_score = (
-                voice_score * self.CATEGORY_WEIGHTS["voice"] +
-                facial_score * self.CATEGORY_WEIGHTS["facial"] +
-                pose_score * self.CATEGORY_WEIGHTS["pose"] +
-                content_score * self.CATEGORY_WEIGHTS["content"]
-            )
-            voice_score_display = voice_score
-            content_score_display = content_score
+            overall_score = 0
+        
+        voice_score_display = voice_score or 0.0
+        facial_score_display = facial_score or 0.0
+        pose_score_display = pose_score or 0.0
+        content_score_display = content_score or 0.0
         
         # Identify strengths
         strengths = self._identify_strengths(
-            voice_score or 0, facial_score, pose_score, content_score or 0,
+            voice_score or 0, facial_score_display, pose_score_display, content_score or 0,
             voice, facial, pose, content,
-            voice_skipped, content_skipped
+            voice_skipped, content_skipped, facial_skipped, pose_skipped
         )
         
         # Identify improvements
         improvements = self._identify_improvements(
-            voice_score or 0, facial_score, pose_score, content_score or 0,
+            voice_score or 0, facial_score_display, pose_score_display, content_score or 0,
             voice, facial, pose, content,
-            voice_skipped, content_skipped
+            voice_skipped, content_skipped, facial_skipped, pose_skipped
         )
         
         # Compile timestamped issues
@@ -123,7 +112,7 @@ class ReportGenerator:
         
         # Generate executive summary
         executive_summary = self._generate_executive_summary(
-            overall_score, voice_score_display, facial_score, pose_score, content_score_display,
+            overall_score, voice_score_display, facial_score_display, pose_score_display, content_score_display,
             strengths, improvements,
             has_audio,
             comparison=comparison,
@@ -133,8 +122,8 @@ class ReportGenerator:
         result = {
             "overall_score": round(overall_score, 1),
             "voice_score": round(voice_score_display, 1),
-            "facial_score": round(facial_score, 1),
-            "pose_score": round(pose_score, 1),
+            "facial_score": round(facial_score_display, 1),
+            "pose_score": round(pose_score_display, 1),
             "content_score": round(content_score_display, 1),
             "executive_summary": executive_summary,
             "strengths": strengths,
@@ -176,6 +165,8 @@ class ReportGenerator:
         content: Dict,
         voice_skipped: bool = False,
         content_skipped: bool = False,
+        facial_skipped: bool = False,
+        pose_skipped: bool = False,
     ) -> List[str]:
         """Identify strengths from the analysis."""
         strengths = []
@@ -189,8 +180,8 @@ class ReportGenerator:
             if not voice.get("issues") or len(voice.get("issues", [])) == 0:
                 strengths.append("Clear and confident voice delivery")
         
-        # Facial strengths
-        if facial_score >= self.GOOD_THRESHOLD:
+        # Facial strengths (only if not skipped)
+        if not facial_skipped and facial_score >= self.GOOD_THRESHOLD:
             if facial.get("positivity_score", 0) >= 80:
                 strengths.append("Positive and engaging facial expressions")
             if facial.get("eye_contact_percentage", 0) >= 80:
@@ -198,8 +189,8 @@ class ReportGenerator:
             if facial.get("engagement_score", 0) >= 80:
                 strengths.append("Expressive and engaging demeanor")
         
-        # Pose strengths
-        if pose_score >= self.GOOD_THRESHOLD:
+        # Pose strengths (only if not skipped)
+        if not pose_skipped and pose_score >= self.GOOD_THRESHOLD:
             if pose.get("posture_score", 0) >= 80:
                 strengths.append("Professional and confident posture")
             if pose.get("gesture_score", 0) >= 80:
@@ -234,6 +225,8 @@ class ReportGenerator:
         content: Dict,
         voice_skipped: bool = False,
         content_skipped: bool = False,
+        facial_skipped: bool = False,
+        pose_skipped: bool = False,
     ) -> List[Dict[str, Any]]:
         """Identify areas for improvement."""
         improvements = []
@@ -248,8 +241,8 @@ class ReportGenerator:
                     "priority": self._get_priority(voice_score),
                 })
         
-        # Facial improvements
-        if facial_score < self.GOOD_THRESHOLD:
+        # Facial improvements (only if not skipped)
+        if not facial_skipped and facial_score < self.GOOD_THRESHOLD:
             for issue in facial.get("issues", [])[:2]:
                 improvements.append({
                     "area": "Facial Expression",
@@ -258,8 +251,8 @@ class ReportGenerator:
                     "priority": self._get_priority(facial_score),
                 })
         
-        # Pose improvements
-        if pose_score < self.GOOD_THRESHOLD:
+        # Pose improvements (only if not skipped)
+        if not pose_skipped and pose_score < self.GOOD_THRESHOLD:
             for issue in pose.get("issues", [])[:2]:
                 improvements.append({
                     "area": "Body Language",
@@ -368,7 +361,7 @@ class ReportGenerator:
                 "priority": priority,
             })
         
-        if facial_score < REFINEMENT_THRESHOLD and not any(i["area"] == "Facial Expression" for i in improvements):
+        if not facial_skipped and facial_score < REFINEMENT_THRESHOLD and not any(i["area"] == "Facial Expression" for i in improvements):
             if facial_score < self.GOOD_THRESHOLD:
                 tips = facial_tips_low
                 desc = f"Facial expression score is {facial_score:.0f}% — needs more engagement"
@@ -390,7 +383,7 @@ class ReportGenerator:
                 "priority": priority,
             })
         
-        if pose_score < REFINEMENT_THRESHOLD and not any(i["area"] == "Body Language" for i in improvements):
+        if not pose_skipped and pose_score < REFINEMENT_THRESHOLD and not any(i["area"] == "Body Language" for i in improvements):
             if pose_score < self.GOOD_THRESHOLD:
                 tips = pose_tips_low
                 desc = f"Body language score is {pose_score:.0f}% — posture needs work"

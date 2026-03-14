@@ -89,6 +89,8 @@ def _run_via_runpod(
     video_id: str,
     video_path: str,
     is_audio_only: bool = False,
+    golden_pitch_deck_id: Optional[str] = None,
+    skip_comparison: bool = False,
 ) -> Dict[str, Any]:
     """
     Proxy the analysis to the RunPod serverless endpoint.
@@ -245,7 +247,10 @@ def _run_via_runpod(
         # Run comparison against golden pitch deck locally (lightweight, no GPU)
         comparison_result = None
         actual_golden_id = None
-        golden_reference = run_async(_get_golden_pitch_deck_reference(None))
+        if not skip_comparison and golden_pitch_deck_id:
+            golden_reference = run_async(_get_golden_pitch_deck_reference(golden_pitch_deck_id))
+        else:
+            golden_reference = None
         if golden_reference and golden_reference.get("is_processed"):
             actual_golden_id = golden_reference.get("id")
             logger.info(f"Comparing against golden pitch deck: {actual_golden_id}")
@@ -427,7 +432,8 @@ def run_full_analysis(
     # If RunPod is configured, delegate to serverless endpoint
     if settings.runpod_endpoint_id and settings.runpod_api_key:
         logger.info(f"RunPod proxy mode: delegating analysis {analysis_id} to endpoint {settings.runpod_endpoint_id}")
-        return _run_via_runpod(analysis_id, video_id, video_path, is_audio_only)
+        return _run_via_runpod(analysis_id, video_id, video_path, is_audio_only,
+                              golden_pitch_deck_id, skip_comparison)
 
     from app.db.database import async_session_maker
     from app.db.models import Analysis, AnalysisStatus
@@ -516,10 +522,15 @@ def run_full_analysis(
                     logger.info("Extracting audio...")
                     return _extract_audio_sync(video_path, audio_path)
             
+            # Track whether a face/person was detected in the video
+            face_detected_in_video = True  # assume True; set False if detection says no
+
             # Submit frame extraction
             def _extract_frames_task():
+                nonlocal face_detected_in_video
                 if is_audio_only:
                     logger.info("Skipping frame extraction (audio-only file)")
+                    face_detected_in_video = False
                     return []
                 logger.info("Extracting frames...")
                 frames_result = _extract_frames_sync(video_path, str(frames_dir), fps=settings.frame_extraction_fps)
@@ -528,6 +539,10 @@ def run_full_analysis(
                 # Detect face region
                 logger.info("Detecting face region...")
                 face_region_info = _detect_face_region_sync(raw_frames)
+                face_detected_in_video = face_region_info.get("has_face", False)
+                
+                if not face_detected_in_video:
+                    logger.warning("No face/person detected in video — facial and pose analysis will be skipped")
                 
                 if face_region_info.get("is_overlay") and face_region_info.get("crop_region"):
                     logger.info("Webcam overlay detected — creating cropped frames")
@@ -586,17 +601,21 @@ def run_full_analysis(
             else:
                 sampled_frames = person_frames
             
-            # Submit facial analysis
-            if not is_audio_only and sampled_frames:
+            # Submit facial analysis (only if a face/person was detected)
+            if not is_audio_only and sampled_frames and face_detected_in_video:
                 futures["facial"] = executor.submit(
                     _run_facial_analysis_sync, analysis_id, sampled_frames
                 )
+            elif not is_audio_only and not face_detected_in_video:
+                facial_result = {"skipped": True, "reason": "No face/person detected in video", "overall_score": 0}
             
-            # Submit pose analysis
-            if not is_audio_only and sampled_frames:
+            # Submit pose analysis (only if a face/person was detected)
+            if not is_audio_only and sampled_frames and face_detected_in_video:
                 futures["pose"] = executor.submit(
                     _run_pose_analysis_sync, analysis_id, sampled_frames
                 )
+            elif not is_audio_only and not face_detected_in_video:
+                pose_result = {"skipped": True, "reason": "No face/person detected in video", "overall_score": 0}
             
             # Collect results as they complete
             for name, future in futures.items():
@@ -649,7 +668,7 @@ def run_full_analysis(
         golden_reference = None
         actual_golden_id = None
         
-        if not skip_comparison:
+        if not skip_comparison and golden_pitch_deck_id:
             golden_reference = run_async(_get_golden_pitch_deck_reference(golden_pitch_deck_id))
             
             if golden_reference and golden_reference.get("is_processed"):
@@ -1219,32 +1238,28 @@ def _create_cropped_frames_sync(
 
 
 async def _get_golden_pitch_deck_reference(
-    golden_pitch_deck_id: Optional[str] = None
+    golden_pitch_deck_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Get golden pitch deck reference data for comparison.
     
     Args:
-        golden_pitch_deck_id: Optional specific ID, otherwise uses active one
+        golden_pitch_deck_id: Specific deck ID to compare against. If None, returns None (no comparison).
         
     Returns:
         Dict with reference data or None if not available
     """
+    if not golden_pitch_deck_id:
+        return None
+
     from app.db.database import async_session_maker
     from app.db.models import GoldenPitchDeck
     from sqlalchemy import select
     
     async with async_session_maker() as session:
-        if golden_pitch_deck_id:
-            # Get specific golden pitch deck
-            query = select(GoldenPitchDeck).where(
-                GoldenPitchDeck.id == golden_pitch_deck_id
-            )
-        else:
-            # Get active golden pitch deck
-            query = select(GoldenPitchDeck).where(
-                GoldenPitchDeck.is_active == True
-            )
+        query = select(GoldenPitchDeck).where(
+            GoldenPitchDeck.id == golden_pitch_deck_id
+        )
         
         result = await session.execute(query)
         golden_deck = result.scalar_one_or_none()

@@ -6,9 +6,9 @@ from typing import Dict, Any, List, Optional
 import os
 import sys
 
-# Prevent HuggingFace from making HTTP requests when model is already cached
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# Allow HuggingFace to download models on first run, then use cache
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
 # Add cuDNN DLLs to PATH for ctranslate2 CUDA support (Windows only)
 if sys.platform == "win32":

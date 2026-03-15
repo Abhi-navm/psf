@@ -8,9 +8,9 @@ from typing import Dict, Any, List, Optional
 from collections import Counter
 import math
 
-# Prevent HuggingFace from making HTTP requests when model is already cached
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# Allow HuggingFace to download models on first run, then use cache
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
 from app.core.logging import logger
 from app.core.config import settings

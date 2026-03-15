@@ -534,8 +534,10 @@ class ReportGenerator:
         scores = []
         if has_audio and not voice.get("skipped"):
             scores.append(("voice", voice.get("overall_score", 50)))
-        scores.append(("facial", facial.get("overall_score", 50)))
-        scores.append(("pose", pose.get("overall_score", 50)))
+        if not facial.get("skipped"):
+            scores.append(("facial", facial.get("overall_score", 50)))
+        if not pose.get("skipped"):
+            scores.append(("pose", pose.get("overall_score", 50)))
         if has_audio and not content.get("skipped"):
             scores.append(("content", content.get("overall_score", 50)))
         
@@ -666,23 +668,26 @@ class ReportGenerator:
             else:
                 summary_parts.append(f"Your pitch differs significantly from the golden reference (similarity: {comp_score:.0f}%).")
         
-        # Highlight strongest area (only include areas that were analyzed)
-        scores = {
-            "facial expressions": facial_score,
-            "body language": pose_score,
-        }
+        # Highlight strongest area (only include areas that were actually analyzed)
+        scores = {}
+        if facial_score and facial_score > 0:
+            scores["facial expressions"] = facial_score
+        if pose_score and pose_score > 0:
+            scores["body language"] = pose_score
         if has_audio and voice_score > 0:
             scores["voice delivery"] = voice_score
         if has_audio and content_score > 0:
             scores["speech content"] = content_score
-        best_area = max(scores, key=scores.get)
-        worst_area = min(scores, key=scores.get)
         
-        if scores[best_area] >= self.GOOD_THRESHOLD:
-            summary_parts.append(f"Your {best_area} is a strength (score: {scores[best_area]:.0f}/100).")
-        
-        if scores[worst_area] < self.GOOD_THRESHOLD:
-            summary_parts.append(f"Focus improvement on {worst_area} (score: {scores[worst_area]:.0f}/100).")
+        if scores:
+            best_area = max(scores, key=scores.get)
+            worst_area = min(scores, key=scores.get)
+            
+            if scores[best_area] >= self.GOOD_THRESHOLD:
+                summary_parts.append(f"Your {best_area} is a strength (score: {scores[best_area]:.0f}/100).")
+            
+            if scores[worst_area] < self.GOOD_THRESHOLD:
+                summary_parts.append(f"Focus improvement on {worst_area} (score: {scores[worst_area]:.0f}/100).")
         
         # Add top strength and improvement
         if strengths:

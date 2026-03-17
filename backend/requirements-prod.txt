@@ -9,6 +9,9 @@ pydantic-settings>=2.5.0
 sqlalchemy==2.0.25
 aiosqlite==0.19.0
 
+# Redis (health check)
+redis>=5.0.0
+
 # HTTP client (for RunPod API calls)
 httpx>=0.25.0
 
@@ -25,3 +28,4 @@ groq>=0.4.0
 # Utils
 python-dotenv==1.0.0
 aiofiles==23.2.1
+loguru>=0.7.0

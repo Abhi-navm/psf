@@ -370,11 +370,51 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         ) from e
                     timings[name] = f"error: {e}"
 
+        # If facial analyzer internally found no faces, also skip pose
+        if facial_result.get("skipped") and not pose_result.get("skipped"):
+            pose_result = {
+                "skipped": True,
+                "reason": facial_result.get("reason", "No face/person detected in video"),
+                "overall_score": 0,
+            }
+
         timings["phase2_total"] = round(time.time() - t0, 2)
+
+        # ── Correct voice WPM using actual transcript word count ──
+        transcript_text = transcription_result.get("text", "")
+        if transcript_text and not voice_result.get("skipped"):
+            segments = transcription_result.get("segments", [])
+            word_count = len(transcript_text.split())
+            # Calculate speaking duration from transcript segments
+            if segments:
+                speak_start = segments[0].get("start", 0)
+                speak_end = segments[-1].get("end", 0)
+                speaking_duration = speak_end - speak_start
+            else:
+                speaking_duration = 0
+            if speaking_duration > 0 and word_count > 10:
+                actual_wpm = (word_count / speaking_duration) * 60
+                voice_result["speaking_rate_wpm"] = round(actual_wpm, 1)
+                # Recalculate pace-dependent scores with corrected WPM
+                IDEAL_MIN, IDEAL_MAX = 120, 150
+                # Pace score
+                if IDEAL_MIN <= actual_wpm <= IDEAL_MAX:
+                    voice_result["pace_score"] = 90.0
+                else:
+                    deviation = abs(actual_wpm - 135)
+                    voice_result["pace_score"] = round(max(30, 90 - deviation * 0.5), 1)
+                # Recalculate overall voice score with corrected pace
+                voice_result["overall_score"] = round(
+                    voice_result.get("energy_score", 50) * 0.2 +
+                    voice_result.get("clarity_score", 50) * 0.25 +
+                    voice_result["pace_score"] * 0.2 +
+                    voice_result.get("confidence_score", 50) * 0.2 +
+                    voice_result.get("tone_score", 50) * 0.15,
+                    1
+                )
 
         # ── Phase 3: Content analysis (needs transcript) ─────────
         t0 = time.time()
-        transcript_text = transcription_result.get("text", "")
         if transcript_text and not transcription_result.get("skipped"):
             content_result = _analyze_content(
                 transcript_text,

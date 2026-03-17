@@ -175,16 +175,24 @@ class VoiceAnalyzer:
         # Find speech and pause segments
         is_speech = rms > threshold
         
-        # Count transitions (approximates syllables/words)
-        transitions = np.sum(np.abs(np.diff(is_speech.astype(int))))
+        # Calculate speaking time (exclude silence) for accurate WPM
+        frame_duration = 512 / sr  # Default hop length
+        speech_frames = np.sum(is_speech)
+        speaking_time = speech_frames * frame_duration
         
-        # Estimate words per minute (rough approximation)
-        # Average ~1.5 syllables per word, ~2 transitions per syllable
-        estimated_words = transitions / 3
-        estimated_wpm = (estimated_words / duration) * 60 if duration > 0 else 0
+        # Use onset detection for better syllable/word estimation
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        onsets = librosa.onset.onset_detect(y=y, sr=sr, onset_envelope=onset_env)
+        num_onsets = len(onsets)
+        
+        # Each onset roughly corresponds to a syllable; ~1.5 syllables per word
+        estimated_words = num_onsets / 1.5
+        
+        # Use speaking_time (not total duration) for WPM to avoid penalizing pauses
+        effective_duration = max(speaking_time, duration * 0.5)  # At least half the total
+        estimated_wpm = (estimated_words / effective_duration) * 60 if effective_duration > 0 else 0
         
         # Detect pauses (consecutive silence frames)
-        frame_duration = 512 / sr  # Default hop length
         pause_frames = np.sum(~is_speech)
         total_pause_time = pause_frames * frame_duration
         pause_frequency = total_pause_time / duration if duration > 0 else 0
@@ -254,12 +262,33 @@ class VoiceAnalyzer:
     
     def _detect_chunk_emotion(self, chunk: np.ndarray, sr: int) -> Dict[str, Any]:
         """Detect emotion in audio chunk using SpeechBrain."""
-        # Placeholder - actual implementation would use the model
-        return {
-            "dominant": "neutral",
-            "confidence": 0.5,
-            "scores": {"neutral": 0.5, "happy": 0.2, "sad": 0.1, "angry": 0.1, "fear": 0.1}
-        }
+        try:
+            import torch
+            import torchaudio
+            
+            # Resample to 16kHz if needed
+            waveform = torch.tensor(chunk).unsqueeze(0).float()
+            
+            # Run inference
+            out_prob, score, index, text_lab = self.emotion_model.classify_batch(waveform)
+            label = text_lab[0].lower()
+            prob = float(score.squeeze())
+            
+            # Map SpeechBrain labels to our emotion set
+            label_map = {"hap": "happy", "sad": "sad", "ang": "angry", "neu": "neutral"}
+            dominant = label_map.get(label, "neutral")
+            
+            scores = {"neutral": 0.1, "happy": 0.1, "sad": 0.1, "angry": 0.1}
+            scores[dominant] = prob
+            remaining = 1.0 - prob
+            for k in scores:
+                if k != dominant:
+                    scores[k] = remaining / (len(scores) - 1)
+            
+            return {"dominant": dominant, "confidence": prob, "scores": scores}
+        except Exception as e:
+            logger.warning(f"SpeechBrain emotion detection failed: {e}")
+            return self._estimate_emotion_from_features(chunk, sr)
     
     def _estimate_emotion_from_features(
         self, 
@@ -269,29 +298,44 @@ class VoiceAnalyzer:
         """Estimate emotion from acoustic features (fallback)."""
         import librosa
         
-        # Extract lightweight features only (no pyin — too slow per chunk)
-        rms = np.mean(librosa.feature.rms(y=chunk))
-        zcr = np.mean(librosa.feature.zero_crossing_rate(chunk))
+        # Extract lightweight features
+        rms = float(np.mean(librosa.feature.rms(y=chunk)))
+        zcr = float(np.mean(librosa.feature.zero_crossing_rate(chunk)))
+        spec_cent = float(np.mean(librosa.feature.spectral_centroid(y=chunk, sr=sr)))
         
-        # Simple rule-based emotion estimation using energy and zero-crossing rate
-        if rms > 0.1 and zcr > 0.1:
-            dominant = "excited"
-            confidence = 0.6
-        elif rms < 0.02:
-            dominant = "sad"
-            confidence = 0.5
-        elif zcr < 0.03:
-            dominant = "neutral"
-            confidence = 0.7
+        # Normalize spectral centroid (higher = brighter/more energetic)
+        spec_norm = min(spec_cent / 4000.0, 1.0)
+        
+        # Multi-feature emotion estimation
+        scores = {"neutral": 0.25, "happy": 0.2, "sad": 0.15, "angry": 0.15, "excited": 0.25}
+        
+        if rms > 0.08 and spec_norm > 0.5:
+            scores["excited"] = 0.5
+            scores["happy"] = 0.3
+            scores["neutral"] = 0.1
+        elif rms > 0.05 and zcr > 0.08:
+            scores["happy"] = 0.45
+            scores["excited"] = 0.25
+            scores["neutral"] = 0.15
+        elif rms < 0.015:
+            scores["sad"] = 0.4
+            scores["neutral"] = 0.35
+        elif rms > 0.06 and spec_norm > 0.4:
+            scores["angry"] = 0.3
+            scores["neutral"] = 0.3
+            scores["excited"] = 0.2
         else:
-            dominant = "neutral"
-            confidence = 0.5
+            scores["neutral"] = 0.45
+            scores["happy"] = 0.25
         
-        return {
-            "dominant": dominant,
-            "confidence": confidence,
-            "scores": {dominant: confidence, "neutral": 1 - confidence}
-        }
+        # Normalize
+        total = sum(scores.values())
+        scores = {k: round(v / total, 3) for k, v in scores.items()}
+        
+        dominant = max(scores, key=scores.get)
+        confidence = scores[dominant]
+        
+        return {"dominant": dominant, "confidence": confidence, "scores": scores}
     
     def _detect_issues(
         self,
@@ -360,9 +404,19 @@ class VoiceAnalyzer:
         """Calculate overall and component scores."""
         
         # Energy score (0-100)
-        energy_score = 50.0
-        if not energy.get("is_low_energy"):
-            energy_score = min(100, 60 + energy.get("energy_variance", 0) * 2)
+        mean_energy = energy.get("mean_energy", -30)
+        energy_var = energy.get("energy_variance", 0)
+        if energy.get("is_low_energy"):
+            # Low energy: scale between 30-55 based on how low
+            energy_score = max(30, 55 + (mean_energy + 30) * 2)
+        else:
+            # Normal energy: base 65, boost for good variance (dynamic delivery)
+            energy_score = 65.0
+            if energy_var > 3:
+                energy_score += min(25, energy_var * 3)  # Up to +25 for dynamic delivery
+            if mean_energy > -20:
+                energy_score += 10  # Strong projection bonus
+            energy_score = min(100, energy_score)
         
         # Clarity score based on pitch variance (not too monotone, not too erratic)
         pitch_variance = pitch.get("pitch_variance", 0)
@@ -381,59 +435,79 @@ class VoiceAnalyzer:
             deviation = abs(wpm - 135)  # 135 is middle of ideal range
             pace_score = max(30, 90 - deviation * 0.5)
         
-        # Confidence score - based on energy consistency, pitch stability, and emotion
-        # Higher energy variance with fewer drops = more confident delivery
+        # Confidence score - based on energy consistency, pitch stability, pace, and emotion
+        confidence_score = 50.0
+        
+        # Pitch variance: expressive but controlled = confident
+        if 20 <= pitch_variance <= 80:
+            confidence_score += 20  # Good expressive range
+        elif 10 <= pitch_variance < 20 or 80 < pitch_variance <= 120:
+            confidence_score += 12
+        elif pitch_variance < 10:
+            confidence_score += 0  # Monotone = less confident
+        else:
+            confidence_score += 5  # Very erratic
+        
+        # Energy: consistent volume = confident (penalize only excessive drops)
         energy_drops = energy.get("energy_drops", 0)
-        confidence_base = 70.0
-        
-        # Penalize for energy drops (uncertainty markers)
-        confidence_score = confidence_base - (energy_drops * 3)
-        
-        # Bonus for good pitch variance (expressive but controlled)
-        if 20 <= pitch_variance <= 60:
+        drop_rate = energy_drops / max(1, pace.get("estimated_wpm", 100) / 10)
+        if drop_rate < 1:
             confidence_score += 15
-        elif 10 <= pitch_variance < 20 or 60 < pitch_variance <= 80:
+        elif drop_rate < 2:
+            confidence_score += 8
+        else:
+            confidence_score -= 5
+        
+        # Pace: speaking at a good pace = confident
+        if self.IDEAL_WPM_MIN <= wpm <= self.IDEAL_WPM_MAX:
+            confidence_score += 15
+        elif abs(wpm - 135) < 30:
             confidence_score += 8
         
-        # Factor in emotion if available (neutral/happy emotions boost confidence)
+        # Factor in emotion if available
         timeline = emotion.get("timeline", [])
         if timeline:
             confident_emotions = ["neutral", "happy", "excited"]
             confident_count = sum(1 for e in timeline if e.get("emotion", "").lower() in confident_emotions)
-            emotion_ratio = confident_count / len(timeline) if timeline else 0
-            confidence_score += emotion_ratio * 15
+            emotion_ratio = confident_count / len(timeline)
+            confidence_score += emotion_ratio * 10
         
-        confidence_score = max(20, min(100, confidence_score))
+        confidence_score = max(25, min(100, confidence_score))
         
         # Tone score (Executive presence) - measures professionalism and authority
-        # Based on: consistent pacing, appropriate energy, controlled pitch
-        tone_base = 60.0
+        tone_score = 55.0
         
-        # Reward for ideal speaking pace
+        # Reward for good speaking pace (within or close to ideal range)
         if self.IDEAL_WPM_MIN <= wpm <= self.IDEAL_WPM_MAX:
-            tone_base += 15
-        elif abs(wpm - 135) < 20:
-            tone_base += 8
+            tone_score += 15
+        elif abs(wpm - 135) < 30:
+            tone_score += 10
+        elif abs(wpm - 135) < 50:
+            tone_score += 5
         
-        # Penalize monotone delivery
+        # Pitch expressiveness (not monotone but not erratic)
         if pitch.get("is_monotone"):
-            tone_base -= 15
+            tone_score -= 10
+        elif 15 <= pitch_variance <= 80:
+            tone_score += 10  # Good controlled variation
         
-        # Reward for energy consistency (lower variance but not flat)
+        # Energy consistency
         energy_var = energy.get("energy_variance", 0)
-        if 3 <= energy_var <= 8:
-            tone_base += 15  # Controlled, professional variation
-        elif 2 <= energy_var < 3 or 8 < energy_var <= 12:
-            tone_base += 8
+        if 2 <= energy_var <= 12:
+            tone_score += 10  # Controlled, professional variation
+        elif energy_var > 12:
+            tone_score += 3  # A bit too dynamic but still engaged
         
-        # Pause frequency impacts executive tone (strategic pauses are good)
+        # Pause frequency (strategic pauses are good, too many is bad)
         pause_freq = pace.get("pause_frequency", 0)
-        if 0.08 <= pause_freq <= 0.15:
-            tone_base += 10  # Good use of pauses for emphasis
-        elif pause_freq > 0.25:
-            tone_base -= 10  # Too many pauses
+        if 0.05 <= pause_freq <= 0.20:
+            tone_score += 10  # Good use of pauses
+        elif 0.20 < pause_freq <= 0.30:
+            tone_score += 3  # Slightly too many pauses
+        elif pause_freq > 0.30:
+            tone_score -= 5  # Excessive pausing
         
-        tone_score = max(20, min(100, tone_base))
+        tone_score = max(25, min(100, tone_score))
         
         # Overall score (weighted average including new scores)
         overall = (

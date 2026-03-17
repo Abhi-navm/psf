@@ -41,6 +41,22 @@ except ImportError:
     shared_task = _noop_task
 
 
+def _convert_numpy(obj):
+    """Recursively convert numpy types to native Python types."""
+    import numpy as np
+    if isinstance(obj, dict):
+        return {k: _convert_numpy(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_numpy(v) for v in obj]
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
 def get_or_create_event_loop():
     """Get existing event loop or create a new one."""
     try:
@@ -244,6 +260,17 @@ def _run_via_runpod(
         content = result.get("content_analysis", {})
         timings = result.get("timings", {})
 
+        # If facial was skipped (no person detected), also skip pose
+        if facial.get("skipped") and not pose.get("skipped"):
+            pose = {
+                "skipped": True,
+                "reason": facial.get("reason", "No face/person detected in video"),
+                "overall_score": 0,
+                "posture_score": 0, "gesture_score": 0, "movement_score": 0,
+                "avg_shoulder_alignment": 0, "gesture_frequency": 0, "fidgeting_frequency": 0,
+                "issues": [], "pose_timeline": [],
+            }
+
         # Run comparison against golden pitch deck locally (lightweight, no GPU)
         comparison_result = None
         actual_golden_id = None
@@ -267,6 +294,10 @@ def _run_via_runpod(
         else:
             logger.info("No processed golden pitch deck available for comparison")
 
+        # Convert numpy types before saving
+        if comparison_result:
+            comparison_result = _convert_numpy(comparison_result)
+
         # Generate report locally with comparison data
         from app.analyzers.report_generator import ReportGenerator
         report_gen = ReportGenerator()
@@ -279,6 +310,7 @@ def _run_via_runpod(
             "comparison": comparison_result,
             "golden_pitch_deck_id": actual_golden_id,
         })
+        report = _convert_numpy(report)
 
         # Save each sub-analysis and the report to DB.
         async def save_results():

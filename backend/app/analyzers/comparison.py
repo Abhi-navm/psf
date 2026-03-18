@@ -982,8 +982,28 @@ Keywords (comma-separated only):"""
         pose_score = pose_comparison.get("overall_similarity_score", 0)
         facial_score = (facial_comparison or {}).get("overall_similarity_score", 0)
         
-        # Weight: Content 40%, Voice 25%, Pose 15%, Facial 20%
-        weighted_score = content_score * 0.4 + voice_score * 0.25 + pose_score * 0.15 + facial_score * 0.2
+        # Check which comparisons have actual data (non-empty comparisons dict)
+        # When facial/pose are skipped (no person detected), exclude them
+        category_weights = {}
+        if content_comparison.get("comparisons") or content_comparison.get("keyword_comparison") or content_score > 0:
+            category_weights["content"] = (0.4, content_score)
+        if voice_comparison.get("comparisons") or voice_score > 0:
+            category_weights["voice"] = (0.25, voice_score)
+        pose_has_data = pose_comparison.get("comparisons") and len(pose_comparison["comparisons"]) > 0
+        if pose_has_data or pose_score > 0:
+            category_weights["pose"] = (0.15, pose_score)
+        facial_has_data = (facial_comparison or {}).get("comparisons") and len((facial_comparison or {}).get("comparisons", {})) > 0
+        if facial_has_data or facial_score > 0:
+            category_weights["facial"] = (0.2, facial_score)
+        
+        # Renormalize weights for available categories only
+        if category_weights:
+            total_weight = sum(w for w, _ in category_weights.values())
+            weighted_score = sum(
+                (w / total_weight) * s for w, s in category_weights.values()
+            )
+        else:
+            weighted_score = 0
         
         # Generate recommendations based on comparison
         recommendations = []

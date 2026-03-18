@@ -394,14 +394,18 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 speaking_duration = 0
             if speaking_duration > 0 and word_count > 10:
                 actual_wpm = (word_count / speaking_duration) * 60
+                old_wpm = voice_result.get("speaking_rate_wpm", 0)
                 voice_result["speaking_rate_wpm"] = round(actual_wpm, 1)
                 # Recalculate pace-dependent scores with corrected WPM
                 IDEAL_MIN, IDEAL_MAX = 120, 150
-                # Pace score
+                # Pace score with asymmetric penalty
                 if IDEAL_MIN <= actual_wpm <= IDEAL_MAX:
                     voice_result["pace_score"] = 90.0
+                elif actual_wpm > IDEAL_MAX:
+                    deviation = actual_wpm - IDEAL_MAX
+                    voice_result["pace_score"] = round(max(50, 90 - deviation * 0.3), 1)
                 else:
-                    deviation = abs(actual_wpm - 135)
+                    deviation = IDEAL_MIN - actual_wpm
                     voice_result["pace_score"] = round(max(30, 90 - deviation * 0.5), 1)
                 # Recalculate overall voice score with corrected pace
                 voice_result["overall_score"] = round(
@@ -412,6 +416,18 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     voice_result.get("tone_score", 50) * 0.15,
                     1
                 )
+                # Patch issue text to use corrected WPM instead of acoustic WPM
+                for issue in voice_result.get("issues", []):
+                    if issue.get("type") == "speaking_too_fast":
+                        issue["description"] = f"Speaking rate ({round(actual_wpm):.0f} WPM) is above ideal range"
+                    elif issue.get("type") == "speaking_too_slow":
+                        issue["description"] = f"Speaking rate ({round(actual_wpm):.0f} WPM) is below ideal range"
+                # Remove speaking_too_fast/slow issues if corrected WPM is actually in range
+                if IDEAL_MIN <= actual_wpm <= IDEAL_MAX:
+                    voice_result["issues"] = [
+                        i for i in voice_result.get("issues", [])
+                        if i.get("type") not in ("speaking_too_fast", "speaking_too_slow")
+                    ]
 
         # ── Phase 3: Content analysis (needs transcript) ─────────
         t0 = time.time()

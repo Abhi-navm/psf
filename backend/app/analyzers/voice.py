@@ -17,8 +17,8 @@ class VoiceAnalyzer:
     IDEAL_WPM_MAX = 150
     
     # Filler word patterns
-    COMMON_FILLERS = ["um", "uh", "like", "you know", "basically", "actually", 
-                      "literally", "so", "well", "right", "okay"]
+    COMMON_FILLERS = ["um", "uh", "like", "you know", "basically",
+                      "literally", "okay"]
     
     def __init__(self):
         """Initialize the voice analyzer."""
@@ -108,11 +108,11 @@ class VoiceAnalyzer:
         else:
             y_pitch = y
         
-        # Extract pitch using pyin
+        # Extract pitch using pyin — constrain to human speech range
         f0, voiced_flag, voiced_probs = librosa.pyin(
             y_pitch, 
-            fmin=librosa.note_to_hz('C2'),
-            fmax=librosa.note_to_hz('C7'),
+            fmin=75,   # Low male voice fundamental
+            fmax=400,  # High female voice fundamental
             sr=sr
         )
         
@@ -420,19 +420,25 @@ class VoiceAnalyzer:
         
         # Clarity score based on pitch variance (not too monotone, not too erratic)
         pitch_variance = pitch.get("pitch_variance", 0)
-        if pitch_variance < 10:
+        if pitch_variance < 5:
             clarity_score = 40.0  # Too monotone
-        elif pitch_variance > 100:
-            clarity_score = 60.0  # Too erratic
+        elif pitch_variance > 60:
+            clarity_score = 65.0  # Very dynamic but still clear
+        elif pitch_variance > 40:
+            clarity_score = 80.0  # Dynamic delivery
         else:
-            clarity_score = 70 + min(30, pitch_variance * 0.5)
+            # 5-40 Hz variance is the sweet spot for speech
+            clarity_score = 70 + min(25, pitch_variance * 0.6)
         
-        # Pace score
+        # Pace score (asymmetric: slightly fast is less penalized than very slow)
         wpm = pace.get("estimated_wpm", 130)
         if self.IDEAL_WPM_MIN <= wpm <= self.IDEAL_WPM_MAX:
             pace_score = 90.0
+        elif wpm > self.IDEAL_WPM_MAX:
+            deviation = wpm - self.IDEAL_WPM_MAX
+            pace_score = max(50, 90 - deviation * 0.3)
         else:
-            deviation = abs(wpm - 135)  # 135 is middle of ideal range
+            deviation = self.IDEAL_WPM_MIN - wpm
             pace_score = max(30, 90 - deviation * 0.5)
         
         # Confidence score - based on energy consistency, pitch stability, pace, and emotion

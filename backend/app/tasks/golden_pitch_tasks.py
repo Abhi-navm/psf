@@ -289,6 +289,16 @@ def _process_golden_locally(
         if has_audio:
             logger.info("Running voice analysis...")
             voice_result = _run_voice_analysis_sync(audio_path)
+            # Correct WPM using transcript word count (acoustic WPM is unreliable)
+            if transcript and segments and not voice_result.get("skipped"):
+                word_count = len(transcript.split())
+                speak_start = segments[0].get("start", 0)
+                speak_end = segments[-1].get("end", 0)
+                speaking_duration = speak_end - speak_start
+                if speaking_duration > 0 and word_count > 10:
+                    actual_wpm = (word_count / speaking_duration) * 60
+                    voice_result["speaking_rate_wpm"] = round(actual_wpm, 1)
+                    logger.info(f"Golden pitch WPM corrected: acoustic -> {actual_wpm:.1f}")
         
         # Step 5: Run facial analysis
         logger.info("Running facial analysis...")

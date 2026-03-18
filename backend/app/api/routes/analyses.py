@@ -3,8 +3,9 @@ Analysis endpoints for starting, monitoring, and retrieving results.
 """
 
 import threading
+from collections import Counter
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +37,8 @@ from app.api.schemas import (
     ContentAnalysisResponse,
     AnalysisReportResponse,
     ErrorResponse,
+    WorkerAggregateRequest,
+    WorkerAggregateResponse,
 )
 from app.tasks.analysis_tasks import run_full_analysis
 from app.api.dependencies import get_user_id
@@ -417,3 +420,169 @@ async def cancel_analysis(
     logger.info(f"Analysis cancelled: {analysis_id}")
     
     return {"message": "Analysis cancelled"}
+
+
+@router.post(
+    "/aggregate",
+    response_model=WorkerAggregateResponse,
+    responses={400: {"model": ErrorResponse}},
+)
+async def aggregate_analyses(
+    request: WorkerAggregateRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Aggregate AI recommendations across multiple analyses for a single worker.
+
+    Given a list of analysis IDs, returns:
+    - Average scores across all analyses
+    - Recurring issues sorted by frequency
+    - Consolidated AI recommendations prioritized by how often they appear
+    - Common filler words across all videos
+    - Score trend over time
+    """
+    if len(request.analysis_ids) > 100:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "Maximum 100 analysis IDs", "code": "TOO_MANY_IDS"},
+        )
+
+    # Fetch all completed analyses with reports and content analysis
+    result = await db.execute(
+        select(Analysis)
+        .options(
+            selectinload(Analysis.report),
+            selectinload(Analysis.content_analysis),
+            selectinload(Analysis.voice_analysis),
+        )
+        .where(
+            Analysis.id.in_(request.analysis_ids),
+            Analysis.status == AnalysisStatus.COMPLETED,
+        )
+    )
+    analyses = result.scalars().all()
+
+    if not analyses:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "No completed analyses found for given IDs", "code": "NO_COMPLETED_ANALYSES"},
+        )
+
+    total = len(analyses)
+
+    # ── Collect scores ──
+    overall_scores, voice_scores, facial_scores = [], [], []
+    pose_scores, content_scores, comparison_scores = [], [], []
+    score_trend = []
+
+    for a in sorted(analyses, key=lambda x: x.created_at):
+        r = a.report
+        if not r:
+            continue
+        overall_scores.append(r.overall_score)
+        voice_scores.append(r.voice_score)
+        facial_scores.append(r.facial_score)
+        pose_scores.append(r.pose_score)
+        content_scores.append(r.content_score)
+        if r.comparison_overall_score is not None:
+            comparison_scores.append(r.comparison_overall_score)
+        score_trend.append({
+            "analysis_id": a.id,
+            "date": a.created_at.isoformat(),
+            "overall_score": r.overall_score,
+        })
+
+    def _avg(lst):
+        return round(sum(lst) / len(lst), 1) if lst else 0.0
+
+    # ── Aggregate issues from improvements + recommendations ──
+    issue_counter: Counter = Counter()      # (category, issue_key) -> count
+    issue_details: dict = {}                # (category, issue_key) -> {description, suggestion, severity}
+    rec_counter: Counter = Counter()        # (category, title) -> count
+    rec_details: dict = {}                  # (category, title) -> {description, priority}
+    filler_counter: Counter = Counter()     # word -> total count
+
+    for a in analyses:
+        r = a.report
+        if not r:
+            continue
+
+        # Improvements (per-video issues)
+        for imp in (r.improvements or []):
+            area = imp.get("area", "General")
+            desc = imp.get("description", "")
+            key = (area, desc)
+            issue_counter[key] += 1
+            if key not in issue_details:
+                issue_details[key] = {
+                    "suggestion": imp.get("suggestion", ""),
+                    "severity": imp.get("priority", "medium"),
+                }
+
+        # Recommendations (includes comparison recs)
+        for rec in (r.recommendations or []):
+            cat = rec.get("category", "general")
+            title = rec.get("title", "")
+            key = (cat, title)
+            rec_counter[key] += 1
+            if key not in rec_details:
+                rec_details[key] = {
+                    "description": rec.get("description", ""),
+                    "priority": rec.get("priority", "medium"),
+                }
+
+        # Filler words from content analysis
+        ca = a.content_analysis
+        if ca and ca.filler_words:
+            for fw in ca.filler_words:
+                word = fw.get("word", "") if isinstance(fw, dict) else str(fw)
+                count = fw.get("count", 1) if isinstance(fw, dict) else 1
+                filler_counter[word] += count
+
+    # ── Build recurring issues (sorted by frequency) ──
+    recurring_issues = []
+    for (category, desc), count in issue_counter.most_common():
+        details = issue_details[(category, desc)]
+        recurring_issues.append({
+            "category": category,
+            "issue": desc,
+            "description": desc,
+            "suggestion": details["suggestion"],
+            "severity": details["severity"],
+            "occurrence_count": count,
+            "total_analyses": total,
+            "frequency_percent": round(count / total * 100, 1),
+        })
+
+    # ── Build aggregated recommendations (sorted by frequency) ──
+    aggregated_recs = []
+    for (cat, title), count in rec_counter.most_common():
+        details = rec_details[(cat, title)]
+        aggregated_recs.append({
+            "category": cat,
+            "title": title,
+            "description": details["description"],
+            "priority": details["priority"],
+            "occurrence_count": count,
+            "frequency_percent": round(count / total * 100, 1),
+        })
+
+    # ── Common filler words ──
+    common_fillers = [
+        {"word": word, "total_count": count, "avg_per_video": round(count / total, 1)}
+        for word, count in filler_counter.most_common(10)
+    ]
+
+    return WorkerAggregateResponse(
+        total_analyses=total,
+        avg_overall_score=_avg(overall_scores),
+        avg_voice_score=_avg(voice_scores),
+        avg_facial_score=_avg(facial_scores),
+        avg_pose_score=_avg(pose_scores),
+        avg_content_score=_avg(content_scores),
+        avg_comparison_score=_avg(comparison_scores) if comparison_scores else None,
+        recurring_issues=recurring_issues,
+        aggregated_recommendations=aggregated_recs,
+        common_filler_words=common_fillers,
+        score_trend=score_trend,
+    )

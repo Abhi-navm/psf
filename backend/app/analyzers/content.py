@@ -15,8 +15,8 @@ class ContentAnalyzer:
     # Common filler words to detect
     FILLER_WORDS = [
         "um", "uh", "er", "ah", "like", "you know", "basically", "actually",
-        "literally", "so", "well", "right", "okay", "yeah", "I mean",
-        "sort of", "kind of", "stuff", "things", "whatever"
+        "literally", "okay", "yeah", "I mean",
+        "sort of", "kind of", "stuff", "whatever"
     ]
     
     # Weak phrases that reduce persuasion

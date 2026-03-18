@@ -301,3 +301,47 @@ class GoldenPitchDeckListResponse(BaseModel):
     """Schema for golden pitch deck list response."""
     items: List[GoldenPitchDeckResponse]
     total: int
+
+
+# ============== Worker Aggregate Schemas ==============
+
+class WorkerAggregateRequest(BaseModel):
+    """Schema for requesting aggregated recommendations across multiple analyses."""
+    analysis_ids: List[str] = Field(min_length=1, description="List of analysis IDs to aggregate")
+
+
+class RecurringIssue(BaseModel):
+    """A recurring issue found across multiple analyses."""
+    category: str
+    issue: str
+    description: str
+    suggestion: str
+    severity: str
+    occurrence_count: int
+    total_analyses: int
+    frequency_percent: float
+
+
+class AggregateRecommendation(BaseModel):
+    """An aggregated recommendation based on recurring patterns."""
+    category: str
+    title: str
+    description: str
+    priority: str
+    occurrence_count: int
+    frequency_percent: float
+
+
+class WorkerAggregateResponse(BaseModel):
+    """Schema for worker-level aggregated analysis response."""
+    total_analyses: int
+    avg_overall_score: float
+    avg_voice_score: float
+    avg_facial_score: float
+    avg_pose_score: float
+    avg_content_score: float
+    avg_comparison_score: Optional[float] = None
+    recurring_issues: List[RecurringIssue]
+    aggregated_recommendations: List[AggregateRecommendation]
+    common_filler_words: Optional[List[Dict[str, Any]]] = None
+    score_trend: Optional[List[Dict[str, Any]]] = None

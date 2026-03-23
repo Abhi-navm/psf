@@ -1,11 +1,13 @@
 """
 Database configuration and session management.
+Supports both PostgreSQL (production) and SQLite (fallback).
 """
 
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import MetaData
+from sqlalchemy import MetaData, create_engine
+from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
 
@@ -26,14 +28,43 @@ class Base(DeclarativeBase):
     metadata = metadata
 
 
-# Create async engine
-engine = create_async_engine(
-    settings.database_url,
-    echo=settings.debug,
-    future=True,
-)
+# Determine engine kwargs based on database backend
+_is_sqlite = settings.database_url.startswith("sqlite")
 
-# Session factory
+_engine_kwargs = {
+    "echo": settings.debug,
+    "future": True,
+}
+
+if not _is_sqlite:
+    # PostgreSQL: connection pool sized for 50+ parallel tasks
+    _engine_kwargs.update({
+        "pool_size": 20,
+        "max_overflow": 40,
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
+    })
+
+# Async engine (for FastAPI)
+engine = create_async_engine(settings.database_url, **_engine_kwargs)
+
+# Sync engine (for Celery workers)
+_sync_engine_kwargs = {
+    "echo": settings.debug,
+    "future": True,
+}
+if not _is_sqlite:
+    _sync_engine_kwargs.update({
+        "pool_size": 20,
+        "max_overflow": 40,
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
+    })
+
+sync_engine = create_engine(settings.sync_database_url, **_sync_engine_kwargs)
+SyncSessionLocal = sessionmaker(bind=sync_engine, expire_on_commit=False)
+
+# Async session factory
 async_session_maker = async_sessionmaker(
     engine,
     class_=AsyncSession,
@@ -65,3 +96,4 @@ async def init_db() -> None:
 async def close_db() -> None:
     """Close database connections."""
     await engine.dispose()
+    sync_engine.dispose()

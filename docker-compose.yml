@@ -1,6 +1,23 @@
 version: "3.8"
 
 services:
+  # PostgreSQL database (replaces SQLite for concurrent write support)
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=sales_analyzer
+      - POSTGRES_USER=app
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-pitch-analyzer-secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d sales_analyzer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # Redis for Celery broker and result backend
   redis:
     image: redis:7-alpine
@@ -30,14 +47,17 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
-      - DATABASE_URL=sqlite+aiosqlite:///./data/sales_analyzer.db
+      - DATABASE_URL=postgresql+asyncpg://app:${POSTGRES_PASSWORD:-pitch-analyzer-secret}@postgres:5432/sales_analyzer
+      - SYNC_DATABASE_URL=postgresql+psycopg2://app:${POSTGRES_PASSWORD:-pitch-analyzer-secret}@postgres:5432/sales_analyzer
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
     depends_on:
       redis:
         condition: service_healthy
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      postgres:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --workers 4
 
-  # Celery Worker
+  # Celery Worker — lightweight RunPod polling tasks (no GPU needed)
   celery-worker:
     build:
       context: ./backend
@@ -51,12 +71,15 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
-      - DATABASE_URL=sqlite+aiosqlite:///./data/sales_analyzer.db
+      - DATABASE_URL=postgresql+asyncpg://app:${POSTGRES_PASSWORD:-pitch-analyzer-secret}@postgres:5432/sales_analyzer
+      - SYNC_DATABASE_URL=postgresql+psycopg2://app:${POSTGRES_PASSWORD:-pitch-analyzer-secret}@postgres:5432/sales_analyzer
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
     depends_on:
       redis:
         condition: service_healthy
-    command: celery -A app.tasks.celery_app worker --loglevel=info -Q default,video,analysis --concurrency=2
+      postgres:
+        condition: service_healthy
+    command: celery -A app.tasks.celery_app worker --loglevel=info -Q default,video,analysis,runpod --concurrency=20 --pool=threads
 
   # Celery Flower (monitoring)
   flower:
@@ -73,4 +96,5 @@ services:
     command: celery -A app.tasks.celery_app flower --port=5555
 
 volumes:
+  postgres_data:
   redis_data:

@@ -1,8 +1,5 @@
-"""
-Golden Pitch Deck endpoints for managing and processing reference videos.
-"""
+"""Golden Pitch Deck endpoints for managing and processing reference videos."""
 
-import threading
 from datetime import datetime
 from typing import Optional
 
@@ -10,7 +7,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 
-from app.core.config import settings
 from app.core.logging import logger
 from app.db.database import get_db
 from app.db.models import Video, GoldenPitchDeck
@@ -84,26 +80,14 @@ async def create_golden_pitch_deck(
     
     logger.info(f"Created golden pitch deck {golden_deck.id} from video {request.video_id}")
     
-    # Queue for processing
-    if settings.runpod_endpoint_id and settings.runpod_api_key:
-        from app.tasks.golden_pitch_tasks import _process_golden_via_runpod
-
-        def _bg():
-            try:
-                _process_golden_via_runpod(golden_deck.id, request.video_id, video.file_path)
-            except Exception as e:
-                logger.error(f"Golden pitch RunPod processing failed: {e}")
-
-        t = threading.Thread(target=_bg, daemon=True)
-        t.start()
-        logger.info(f"Golden pitch deck {golden_deck.id} dispatched to RunPod")
-    else:
-        from app.tasks.golden_pitch_tasks import process_golden_pitch_deck
-        process_golden_pitch_deck.delay(
-            golden_pitch_deck_id=golden_deck.id,
-            video_id=request.video_id,
-            video_path=video.file_path,
-        )
+    # Queue for processing — Celery task handles RunPod branching internally
+    from app.tasks.golden_pitch_tasks import process_golden_pitch_deck
+    process_golden_pitch_deck.delay(
+        golden_pitch_deck_id=golden_deck.id,
+        video_id=request.video_id,
+        video_path=video.file_path,
+    )
+    logger.info(f"Golden pitch deck {golden_deck.id} dispatched via Celery")
     
     return golden_deck
 
@@ -344,26 +328,14 @@ async def reprocess_golden_pitch_deck(
     golden_deck.updated_at = datetime.utcnow()
     await db.commit()
     
-    # Queue for reprocessing
-    if settings.runpod_endpoint_id and settings.runpod_api_key:
-        from app.tasks.golden_pitch_tasks import _process_golden_via_runpod
-
-        def _bg():
-            try:
-                _process_golden_via_runpod(golden_deck.id, golden_deck.video_id, video.file_path)
-            except Exception as e:
-                logger.error(f"Golden pitch reprocess via RunPod failed: {e}")
-
-        t = threading.Thread(target=_bg, daemon=True)
-        t.start()
-        logger.info(f"Golden pitch deck {golden_pitch_deck_id} dispatched to RunPod for reprocessing")
-    else:
-        from app.tasks.golden_pitch_tasks import process_golden_pitch_deck
-        process_golden_pitch_deck.delay(
-            golden_pitch_deck_id=golden_deck.id,
-            video_id=golden_deck.video_id,
-            video_path=video.file_path,
-        )
+    # Queue for reprocessing — Celery task handles RunPod branching internally
+    from app.tasks.golden_pitch_tasks import process_golden_pitch_deck
+    process_golden_pitch_deck.delay(
+        golden_pitch_deck_id=golden_deck.id,
+        video_id=golden_deck.video_id,
+        video_path=video.file_path,
+    )
+    logger.info(f"Golden pitch deck {golden_pitch_deck_id} dispatched via Celery for reprocessing")
     
     await db.refresh(golden_deck)
     

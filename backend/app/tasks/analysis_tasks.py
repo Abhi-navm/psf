@@ -77,27 +77,29 @@ def run_async(coro):
 
 
 def _upload_to_temp_host(file_path: str) -> str:
-    """Upload a file to a temporary file host and return the download URL."""
-    import httpx
+    """Upload a file to cloud storage and return the download URL."""
+    from app.core.storage import upload_video_for_runpod
+    return upload_video_for_runpod(file_path)
 
-    logger.info(f"Uploading {file_path} to temp file host...")
-    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
-    with httpx.Client(timeout=600, follow_redirects=True) as client:
-        with open(file_path, "rb") as f:
-            resp = client.post(
-                "https://tmpfiles.org/api/v1/upload",
-                files={"file": (os.path.basename(file_path), f, "video/mp4")},
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("status") != "success":
-            raise RuntimeError(f"tmpfiles.org upload failed: {data}")
-        # Convert page URL to direct download URL
-        page_url = data["data"]["url"]
-        dl_url = page_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
-        logger.info(f"Uploaded {file_size_mb:.1f}MB -> {dl_url}")
-        return dl_url
+@shared_task(bind=True, max_retries=2, queue="runpod")
+def run_via_runpod_task(
+    self,
+    analysis_id: str,
+    video_id: str,
+    video_path: str,
+    is_audio_only: bool = False,
+    golden_pitch_deck_id: Optional[str] = None,
+    skip_comparison: bool = False,
+) -> Dict[str, Any]:
+    """
+    Celery task: proxy the analysis to the RunPod serverless endpoint.
+    Uploads video, submits to RunPod, polls for results, saves to DB.
+    """
+    return _run_via_runpod(
+        analysis_id, video_id, video_path, is_audio_only,
+        golden_pitch_deck_id, skip_comparison,
+    )
 
 
 def _run_via_runpod(

@@ -50,18 +50,18 @@ config_updates = {
     "task_time_limit": 1800,  # 30 minutes hard limit
     "task_soft_time_limit": 1500,  # 25 minutes soft limit
     
-    # Worker settings
-    "worker_prefetch_multiplier": 1,  # One task at a time for heavy processing
-    "worker_concurrency": 2,
+    # Worker settings — sized for 50+ parallel RunPod polling tasks
+    "worker_prefetch_multiplier": 4,
+    "worker_concurrency": 20,
     
     # Result settings
     "result_expires": 86400,  # 24 hours
     
-    # Task routes - use default queue for simplicity
-    # "task_routes": {
-    #     "app.tasks.video_tasks.*": {"queue": "video"},
-    #     "app.tasks.analysis_tasks.*": {"queue": "analysis"},
-    # },
+    # Task routes — separate RunPod polling into its own queue
+    "task_routes": {
+        "app.tasks.analysis_tasks.run_via_runpod_task": {"queue": "runpod"},
+        "app.tasks.golden_pitch_tasks.*": {"queue": "default"},
+    },
     
     # Task default queue
     "task_default_queue": "default",

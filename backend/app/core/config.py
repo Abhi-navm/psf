@@ -30,7 +30,8 @@ class Settings(BaseSettings):
     workers: int = 4
     
     # Database
-    database_url: str = "sqlite+aiosqlite:///./data/sales_analyzer.db"
+    database_url: str = "postgresql+asyncpg://app:pitch-analyzer-secret@localhost:5432/sales_analyzer"
+    sync_database_url: str = "postgresql+psycopg2://app:pitch-analyzer-secret@localhost:5432/sales_analyzer"
     
     # Redis & Celery
     redis_url: str = "redis://localhost:6379/0"
@@ -81,6 +82,20 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             import json
             return json.loads(v)
+        return v
+    
+    @field_validator("sync_database_url", mode="before")
+    @classmethod
+    def derive_sync_url(cls, v, info):
+        """Auto-derive sync_database_url from database_url if not explicitly set."""
+        if v and v != "postgresql+psycopg2://app:pitch-analyzer-secret@localhost:5432/sales_analyzer":
+            return v
+        # Try to derive from database_url
+        db_url = info.data.get("database_url", "")
+        if db_url.startswith("sqlite+aiosqlite"):
+            return db_url.replace("sqlite+aiosqlite", "sqlite")
+        if db_url.startswith("postgresql+asyncpg"):
+            return db_url.replace("postgresql+asyncpg", "postgresql+psycopg2")
         return v
     
     @property

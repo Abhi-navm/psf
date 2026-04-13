@@ -298,44 +298,67 @@ class VoiceAnalyzer:
         """Estimate emotion from acoustic features (fallback)."""
         import librosa
         
-        # Extract lightweight features
-        rms = float(np.mean(librosa.feature.rms(y=chunk)))
-        zcr = float(np.mean(librosa.feature.zero_crossing_rate(chunk)))
-        spec_cent = float(np.mean(librosa.feature.spectral_centroid(y=chunk, sr=sr)))
+        # Handle edge case: empty or invalid audio chunk
+        if chunk is None or len(chunk) == 0:
+            logger.warning("Empty audio chunk for emotion estimation, using neutral defaults")
+            return {"dominant": "neutral", "confidence": 0.5, "scores": {"neutral": 1.0, "happy": 0.0, "sad": 0.0, "angry": 0.0, "excited": 0.0}}
         
-        # Normalize spectral centroid (higher = brighter/more energetic)
-        spec_norm = min(spec_cent / 4000.0, 1.0)
-        
-        # Multi-feature emotion estimation
-        scores = {"neutral": 0.25, "happy": 0.2, "sad": 0.15, "angry": 0.15, "excited": 0.25}
-        
-        if rms > 0.08 and spec_norm > 0.5:
-            scores["excited"] = 0.5
-            scores["happy"] = 0.3
-            scores["neutral"] = 0.1
-        elif rms > 0.05 and zcr > 0.08:
-            scores["happy"] = 0.45
-            scores["excited"] = 0.25
-            scores["neutral"] = 0.15
-        elif rms < 0.015:
-            scores["sad"] = 0.4
-            scores["neutral"] = 0.35
-        elif rms > 0.06 and spec_norm > 0.4:
-            scores["angry"] = 0.3
-            scores["neutral"] = 0.3
-            scores["excited"] = 0.2
-        else:
-            scores["neutral"] = 0.45
-            scores["happy"] = 0.25
-        
-        # Normalize
-        total = sum(scores.values())
-        scores = {k: round(v / total, 3) for k, v in scores.items()}
-        
-        dominant = max(scores, key=scores.get)
-        confidence = scores[dominant]
-        
-        return {"dominant": dominant, "confidence": confidence, "scores": scores}
+        try:
+            # Extract lightweight features
+            rms = float(np.mean(librosa.feature.rms(y=chunk)))
+            zcr = float(np.mean(librosa.feature.zero_crossing_rate(chunk)))
+            spec_cent = float(np.mean(librosa.feature.spectral_centroid(y=chunk, sr=sr)))
+            
+            # Handle NaN values from feature extraction
+            if np.isnan(rms) or np.isnan(zcr) or np.isnan(spec_cent):
+                logger.warning("NaN values in audio features, using neutral defaults")
+                return {"dominant": "neutral", "confidence": 0.5, "scores": {"neutral": 1.0, "happy": 0.0, "sad": 0.0, "angry": 0.0, "excited": 0.0}}
+            
+            # Normalize spectral centroid (higher = brighter/more energetic)
+            spec_norm = min(spec_cent / 4000.0, 1.0)
+            
+            # Multi-feature emotion estimation
+            scores = {"neutral": 0.25, "happy": 0.2, "sad": 0.15, "angry": 0.15, "excited": 0.25}
+            
+            if rms > 0.08 and spec_norm > 0.5:
+                scores["excited"] = 0.5
+                scores["happy"] = 0.3
+                scores["neutral"] = 0.1
+            elif rms > 0.05 and zcr > 0.08:
+                scores["happy"] = 0.45
+                scores["excited"] = 0.25
+                scores["neutral"] = 0.15
+            elif rms < 0.015:
+                scores["sad"] = 0.4
+                scores["neutral"] = 0.35
+            elif rms > 0.06 and spec_norm > 0.4:
+                scores["angry"] = 0.3
+                scores["neutral"] = 0.3
+                scores["excited"] = 0.2
+            else:
+                scores["neutral"] = 0.45
+                scores["happy"] = 0.25
+            
+            # Normalize
+            total = sum(scores.values())
+            if total <= 0:
+                logger.warning("Invalid scores total, using neutral defaults")
+                return {"dominant": "neutral", "confidence": 0.5, "scores": {"neutral": 1.0, "happy": 0.0, "sad": 0.0, "angry": 0.0, "excited": 0.0}}
+            
+            scores = {k: round(v / total, 3) for k, v in scores.items()}
+            
+            # Ensure scores dict is not empty before calling max()
+            if not scores:
+                logger.warning("Scores dict is empty, using neutral defaults")
+                return {"dominant": "neutral", "confidence": 0.5, "scores": {"neutral": 1.0, "happy": 0.0, "sad": 0.0, "angry": 0.0, "excited": 0.0}}
+            
+            dominant = max(scores, key=scores.get)
+            confidence = scores[dominant]
+            
+            return {"dominant": dominant, "confidence": confidence, "scores": scores}
+        except Exception as e:
+            logger.warning(f"Error in emotion feature estimation: {e}, using neutral defaults")
+            return {"dominant": "neutral", "confidence": 0.5, "scores": {"neutral": 1.0, "happy": 0.0, "sad": 0.0, "angry": 0.0, "excited": 0.0}}
     
     def _detect_issues(
         self,

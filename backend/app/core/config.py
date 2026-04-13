@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     deepface_device: str = "cuda"  # Device for DeepFace (cuda or cpu)
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3:8b"
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-4-20250514"
     groq_api_key: str = ""
     groq_model: str = "llama-3.1-8b-instant"
     
@@ -62,6 +64,14 @@ class Settings(BaseSettings):
     max_video_size_mb: int = 1000
     analysis_chunk_duration: int = 30  # seconds
     frame_extraction_fps: float = 0.3  # 0.3 fps = 1 frame every 3.3 seconds (reduced for speed)
+
+    # Validation Gates
+    min_video_duration_seconds: int = 25  # Reject clips shorter than this
+    min_transcript_words: int = 20  # Reject transcripts with fewer words
+    # Comma-separated ISO 639-1 codes, e.g. "en,es". Empty string = all languages accepted.
+    supported_languages: str = ""
+    # Enable LLM-based relevance classifier (requires a working LLM backend)
+    relevance_check_enabled: bool = False
     
     # Webhook Settings
     webhook_url: str = ""  # URL to call when analysis completes
@@ -105,6 +115,13 @@ class Settings(BaseSettings):
     @property
     def max_video_size_bytes(self) -> int:
         return self.max_video_size_mb * 1024 * 1024
+
+    @property
+    def supported_language_list(self) -> List[str]:
+        """Return list of supported ISO 639-1 language codes (empty = all accepted)."""
+        if not self.supported_languages:
+            return []
+        return [lang.strip().lower() for lang in self.supported_languages.split(",") if lang.strip()]
 
 
 @lru_cache

@@ -111,6 +111,50 @@ class TranscriptionError(AIModelError):
         super().__init__("whisper", message, details)
 
 
+class VideoTooShortError(SalesPitchAnalyzerError):
+    """Video or audio clip is shorter than the minimum required duration."""
+
+    def __init__(self, duration: float, min_duration: int):
+        super().__init__(
+            f"Video too short ({duration:.0f}s). Minimum allowed: {min_duration}s",
+            "VIDEO_TOO_SHORT",
+            {"duration_seconds": round(duration, 2), "min_duration_seconds": min_duration},
+        )
+
+
+class UnsupportedLanguageError(SalesPitchAnalyzerError):
+    """Whisper detected a language that is not in the supported list."""
+
+    def __init__(self, language: str, supported: list):
+        super().__init__(
+            f"Unsupported language detected: '{language}'. Supported: {supported}",
+            "UNSUPPORTED_LANGUAGE",
+            {"detected_language": language, "supported_languages": supported},
+        )
+
+
+class TranscriptTooShortError(SalesPitchAnalyzerError):
+    """Transcript word count is below the minimum threshold."""
+
+    def __init__(self, word_count: int, min_words: int):
+        super().__init__(
+            f"Transcript too short ({word_count} words). Minimum required: {min_words}",
+            "TRANSCRIPT_TOO_SHORT",
+            {"word_count": word_count, "min_words": min_words},
+        )
+
+
+class ContentNotRelevantError(SalesPitchAnalyzerError):
+    """LLM classifier determined the content is not a sales pitch or business presentation."""
+
+    def __init__(self, reason: str = ""):
+        super().__init__(
+            "Content does not appear to be a sales pitch or business presentation",
+            "CONTENT_NOT_RELEVANT",
+            {"reason": reason},
+        )
+
+
 class StorageError(SalesPitchAnalyzerError):
     """Error with file storage."""
     

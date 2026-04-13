@@ -2,6 +2,7 @@
 Analysis endpoints for starting, monitoring, and retrieving results.
 """
 
+import asyncio
 from collections import Counter
 from datetime import datetime
 from typing import Optional, List
@@ -43,6 +44,14 @@ from app.tasks.analysis_tasks import run_full_analysis
 from app.api.dependencies import get_user_id
 
 router = APIRouter(prefix="/analyses", tags=["analyses"])
+
+
+async def _run_inprocess_safely(task_func, *args):
+    """Run fallback background task and absorb exceptions already persisted by task code."""
+    try:
+        await asyncio.to_thread(task_func, *args)
+    except Exception as e:
+        logger.error(f"In-process analysis task failed: {e}")
 
 
 @router.post(
@@ -126,7 +135,7 @@ async def start_analysis(
     await db.commit()
     await db.refresh(analysis)
     
-    # Dispatch analysis — always through Celery for reliability and scalability
+    # Dispatch analysis via Celery when available, otherwise run in-process.
     if settings.runpod_endpoint_id and settings.runpod_api_key:
         from app.tasks.analysis_tasks import run_via_runpod_task
         task = run_via_runpod_task.delay(
@@ -137,9 +146,24 @@ async def start_analysis(
             golden_pitch_deck_id=request.golden_pitch_deck_id,
             skip_comparison=request.skip_comparison,
         )
-        analysis.celery_task_id = task.id
-        await db.commit()
-        logger.info(f"Analysis {analysis.id} dispatched to RunPod via Celery task {task.id}")
+        if task is not None and getattr(task, "id", None):
+            analysis.celery_task_id = task.id
+            await db.commit()
+            logger.info(f"Analysis {analysis.id} dispatched to RunPod via Celery task {task.id}")
+        else:
+            analysis.celery_task_id = f"inprocess-{analysis.id}"
+            await db.commit()
+            logger.warning(f"Celery unavailable. Running RunPod analysis in-process for {analysis.id}")
+            asyncio.create_task(_run_inprocess_safely(
+                run_via_runpod_task,
+                None,
+                analysis.id,
+                video_id,
+                video.file_path,
+                video.is_audio_only if hasattr(video, 'is_audio_only') else False,
+                request.golden_pitch_deck_id,
+                request.skip_comparison,
+            ))
     else:
         # Queue Celery task with comparison parameters
         task = run_full_analysis.delay(
@@ -150,9 +174,23 @@ async def start_analysis(
             skip_comparison=request.skip_comparison,
             is_audio_only=video.is_audio_only if hasattr(video, 'is_audio_only') else False,
         )
-        # Update with task ID
-        analysis.celery_task_id = task.id
-        await db.commit()
+        if task is not None and getattr(task, "id", None):
+            analysis.celery_task_id = task.id
+            await db.commit()
+        else:
+            analysis.celery_task_id = f"inprocess-{analysis.id}"
+            await db.commit()
+            logger.warning(f"Celery unavailable. Running local analysis in-process for {analysis.id}")
+            asyncio.create_task(_run_inprocess_safely(
+                run_full_analysis,
+                None,
+                analysis.id,
+                video_id,
+                video.file_path,
+                request.golden_pitch_deck_id,
+                request.skip_comparison,
+                video.is_audio_only if hasattr(video, 'is_audio_only') else False,
+            ))
     
     logger.info(f"Analysis started: {analysis.id} for video {video_id}")
     

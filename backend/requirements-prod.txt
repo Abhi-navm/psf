@@ -28,6 +28,7 @@ ffmpeg-python==0.2.0
 sentence-transformers>=2.2.0
 
 # LLM for semantic keywords in comparison
+anthropic>=0.39.0
 groq>=0.4.0
 
 # Utils

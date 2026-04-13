@@ -9,6 +9,7 @@ import time
 import uuid
 import tempfile
 import traceback
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -17,6 +18,31 @@ import runpod
 
 # ── Ensure backend package is importable ──────────────────────────────
 sys.path.insert(0, "/app/backend")
+
+logger = logging.getLogger(__name__)
+
+# ── Gate exceptions (imported lazily to avoid heavy import at cold start) ─
+def _raise_if_too_short(duration: float) -> None:
+    from app.core.config import settings
+    from app.core.exceptions import VideoTooShortError
+    if duration < settings.min_video_duration_seconds:
+        raise VideoTooShortError(duration, settings.min_video_duration_seconds)
+
+
+def _raise_if_unsupported_language(language: str) -> None:
+    from app.core.config import settings
+    from app.core.exceptions import UnsupportedLanguageError
+    supported = settings.supported_language_list
+    if supported and language.lower() not in supported:
+        raise UnsupportedLanguageError(language, supported)
+
+
+def _raise_if_transcript_too_short(text: str) -> None:
+    from app.core.config import settings
+    from app.core.exceptions import TranscriptTooShortError
+    word_count = len(text.split())
+    if word_count < settings.min_transcript_words:
+        raise TranscriptTooShortError(word_count, settings.min_transcript_words)
 
 # ── Model singletons (survive across warm-worker invocations) ─────────
 _whisper_model = None
@@ -310,6 +336,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         has_audio = audio_result.get("success", False)
 
+        # ── Minimum duration gate ──────────────────────────────────
+        clip_duration = audio_result.get("duration", 0)
+        if clip_duration:
+            _raise_if_too_short(clip_duration)
+
         # Face region detection / cropping
         face_detected = False
         if raw_frames:
@@ -319,12 +350,42 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         timings["extraction"] = round(time.time() - t0, 2)
 
-        # ── Phase 2: Parallel analyses ───────────────────────────
+        # ── Phase 2: Precheck gates first (transcription -> language/length/relevance) ──
         t0 = time.time()
         transcription_result = {"text": "", "segments": [], "skipped": True}
         voice_result = {"skipped": True}
         facial_result = {"skipped": True}
         pose_result = {"skipped": True}
+
+        transcript_text = ""
+        if has_audio:
+            try:
+                transcription_result = _transcribe(audio_path)
+                dur = transcription_result.pop("_duration", None)
+                if dur:
+                    timings["transcription"] = round(dur, 2)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Transcription failed (likely stale worker): {e}"
+                ) from e
+
+            transcript_text = (transcription_result.get("text") or "").strip()
+            
+            # ── Enforce all precheck gates before main analysis ──
+            logger.info(f"Precheck gates: transcript={len(transcript_text.split())} words, language={transcription_result.get('language', 'en')}")
+            
+            _raise_if_unsupported_language(transcription_result.get("language", "en"))
+            _raise_if_transcript_too_short(transcript_text)
+
+            from app.analyzers.content import ContentAnalyzer
+            from app.core.exceptions import ContentNotRelevantError
+            relevance_result = ContentAnalyzer().classify_relevance(transcript_text)
+            if not relevance_result.get("is_relevant", True):
+                raise ContentNotRelevantError(relevance_result.get("reason", "Content is not relevant"))
+            
+            logger.info("All precheck gates passed. Proceeding to main analysis.")
+        elif not is_audio_only:
+            _raise_if_transcript_too_short("")
 
         # Sub-sample frames for speed
         MAX_FRAMES = 30
@@ -334,10 +395,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         else:
             sampled = person_frames
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        # ── Phase 3: Main analyses in parallel after gate pass ───
+        with ThreadPoolExecutor(max_workers=3) as pool:
             futures = {}
             if has_audio:
-                futures["transcription"] = pool.submit(_transcribe, audio_path)
                 futures["voice"] = pool.submit(_analyze_voice, audio_path)
             if not is_audio_only and sampled and face_detected:
                 futures["facial"] = pool.submit(_analyze_facial, sampled)
@@ -352,22 +413,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     dur = res.pop("_duration", None)
                     if dur:
                         timings[name] = round(dur, 2)
-                    if name == "transcription":
-                        transcription_result = res
-                    elif name == "voice":
+                    if name == "voice":
                         voice_result = res
                     elif name == "facial":
                         facial_result = res
                     elif name == "pose":
                         pose_result = res
                 except Exception as e:
-                    # Transcription failures on audio videos are critical
-                    # (e.g. CUDA PTX mismatch on stale workers) — fail the
-                    # job so RunPod retries on a different worker.
-                    if name == "transcription" and has_audio:
-                        raise RuntimeError(
-                            f"Transcription failed (likely stale worker): {e}"
-                        ) from e
                     timings[name] = f"error: {e}"
 
         # If facial analyzer internally found no faces, also skip pose
@@ -381,7 +433,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         timings["phase2_total"] = round(time.time() - t0, 2)
 
         # ── Correct voice WPM using actual transcript word count ──
-        transcript_text = transcription_result.get("text", "")
         if transcript_text and not voice_result.get("skipped"):
             segments = transcription_result.get("segments", [])
             word_count = len(transcript_text.split())
@@ -429,7 +480,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         if i.get("type") not in ("speaking_too_fast", "speaking_too_slow")
                     ]
 
-        # ── Phase 3: Content analysis (needs transcript) ─────────
+        # ── Phase 4: Content analysis (needs transcript) ─────────
         t0 = time.time()
         if transcript_text and not transcription_result.get("skipped"):
             content_result = _analyze_content(
@@ -476,6 +527,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     except Exception as e:
+        # Return structured errors for known gate failures
+        try:
+            from app.core.exceptions import SalesPitchAnalyzerError
+            if isinstance(e, SalesPitchAnalyzerError):
+                return {"error": e.message, "code": e.code, "details": e.details}
+        except ImportError:
+            pass
         return {"error": str(e), "traceback": traceback.format_exc()}
 
     finally:

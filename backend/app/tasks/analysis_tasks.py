@@ -28,7 +28,7 @@ if not any(isinstance(h, _logging.StreamHandler) for h in logger.handlers):
     logger.addHandler(_logging.StreamHandler())
 
 # Celery decorator — only import if not in RunPod-only mode
-def _noop_task(bind=True, max_retries=2):
+def _noop_task(bind=True, max_retries=2, **kwargs):
     """No-op decorator when Celery is not available."""
     def wrapper(func):
         func.delay = lambda *a, **kw: None
@@ -150,6 +150,12 @@ def _run_via_runpod(
             await session.commit()
 
     try:
+        # Enforce local duration gate before proxying to remote workers.
+        clip_duration = _get_video_duration_sync(video_path)
+        if clip_duration and clip_duration < settings.min_video_duration_seconds:
+            from app.core.exceptions import VideoTooShortError
+            raise VideoTooShortError(clip_duration, settings.min_video_duration_seconds)
+
         run_async(update_status(AnalysisStatus.PROCESSING, 5))
 
         # Upload video to temp file host (RunPod has 10MB request body limit)
@@ -262,6 +268,28 @@ def _run_via_runpod(
         content = result.get("content_analysis", {})
         timings = result.get("timings", {})
 
+        # Defensive gate enforcement: reject stale-worker outputs that bypassed validation.
+        transcript_text = (transcription.get("text") or "").strip()
+        detected_lang = (transcription.get("language") or "en").lower()
+        supported_langs = settings.supported_language_list
+
+        if supported_langs and detected_lang not in supported_langs:
+            from app.core.exceptions import UnsupportedLanguageError
+            raise UnsupportedLanguageError(detected_lang, supported_langs)
+
+        if not is_audio_only:
+            from app.core.exceptions import TranscriptTooShortError
+            word_count = len(transcript_text.split()) if transcript_text else 0
+            if word_count < settings.min_transcript_words:
+                raise TranscriptTooShortError(word_count, settings.min_transcript_words)
+
+        if settings.relevance_check_enabled and transcript_text:
+            from app.analyzers.content import ContentAnalyzer
+            from app.core.exceptions import ContentNotRelevantError
+            relevance_result = ContentAnalyzer().classify_relevance(transcript_text)
+            if not relevance_result.get("is_relevant", True):
+                raise ContentNotRelevantError(relevance_result.get("reason", "Content is not relevant"))
+
         # If facial was skipped (no person detected), also skip pose
         if facial.get("skipped") and not pose.get("skipped"):
             pose = {
@@ -283,7 +311,6 @@ def _run_via_runpod(
         if golden_reference and golden_reference.get("is_processed"):
             actual_golden_id = golden_reference.get("id")
             logger.info(f"Comparing against golden pitch deck: {actual_golden_id}")
-            transcript_text = transcription.get("text", "")
             comparison_result = _run_comparison_sync(
                 golden_reference=golden_reference,
                 transcript=transcript_text,
@@ -592,40 +619,81 @@ def run_full_analysis(
             audio_result = audio_future.result()
             has_audio = audio_result.get("success", False)
             person_frames = frames_future.result()
-        
+
+        # ── Minimum duration gate ────────────────────────────────
+        clip_duration = audio_result.get("duration", 0)
+        if clip_duration and clip_duration < settings.min_video_duration_seconds:
+            from app.core.exceptions import VideoTooShortError
+            raise VideoTooShortError(clip_duration, settings.min_video_duration_seconds)
         if not has_audio:
             logger.warning(f"No audio: {audio_result.get('error', 'Unknown')}. Skipping audio-based analyses.")
         
         logger.info(f"Phase 1 complete in {time.time()-phase1_start:.1f}s: has_audio={has_audio}, frames={len(person_frames)}")
         
         # ============================================================
-        # PHASE 2: Run all independent analyses in parallel
-        # Transcription + Voice + Facial + Pose run simultaneously
+        # PHASE 2: Precheck gates (transcription -> language/length/relevance)
         # ============================================================
         phase2_start = time.time()
         run_async(update_status(AnalysisStatus.TRANSCRIBING, 25))
-        logger.info("Starting parallel analysis phase...")
-        
+        logger.info("Running precheck gates before main analysis...")
+
         transcription_result = {"text": "", "segments": [], "skipped": True, "reason": "No audio track"}
         voice_result = {"skipped": True, "reason": "No audio track"}
         facial_result = {"skipped": True, "reason": "Audio-only file"}
         pose_result = {"skipped": True, "reason": "Audio-only file"}
-        
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="analyze") as executor:
+
+        if has_audio:
+            transcription_result = _run_transcription_sync(analysis_id, audio_path)
+            transcript_text = (transcription_result.get("text") or "").strip()
+
+            # ── Language gate ────────────────────────────────────
+            supported = settings.supported_language_list
+            if supported:
+                detected_lang = (transcription_result.get("language") or "en").lower()
+                if detected_lang not in supported:
+                    from app.core.exceptions import UnsupportedLanguageError
+                    logger.warning(f"Language gate failed: {detected_lang} not in {supported}")
+                    raise UnsupportedLanguageError(detected_lang, supported)
+
+            # ── Minimum transcript length gate ───────────────────
+            word_count = len(transcript_text.split())
+            logger.info(f"Precheck: transcript has {word_count} words (min required: {settings.min_transcript_words})")
+            if word_count < settings.min_transcript_words:
+                from app.core.exceptions import TranscriptTooShortError
+                logger.warning(f"Transcript length gate failed: {word_count} < {settings.min_transcript_words}")
+                raise TranscriptTooShortError(word_count, settings.min_transcript_words)
+
+            # ── Relevance gate (LLM) ─────────────────────────────
+            if settings.relevance_check_enabled:
+                from app.analyzers.content import ContentAnalyzer
+                from app.core.exceptions import ContentNotRelevantError
+                relevance = ContentAnalyzer().classify_relevance(transcript_text)
+                logger.info(f"Relevance check: is_relevant={relevance.get('is_relevant')}, confidence={relevance.get('confidence')}")
+                if not relevance.get("is_relevant", True):
+                    logger.warning(f"Relevance gate failed: {relevance.get('reason')}")
+                    raise ContentNotRelevantError(relevance.get("reason", "Content is not relevant"))
+            
+            logger.info("All precheck gates passed. Proceeding to main analysis...")
+        else:
+            transcript_text = ""
+            if not is_audio_only:
+                from app.core.exceptions import TranscriptTooShortError
+                raise TranscriptTooShortError(0, settings.min_transcript_words)
+
+        # ============================================================
+        # PHASE 3: Main analyses in parallel (after gate pass)
+        # ============================================================
+        run_async(update_status(AnalysisStatus.ANALYZING_CONTENT, 75))
+
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="analyze") as executor:
             futures = {}
-            
-            # Submit transcription
-            if has_audio:
-                futures["transcription"] = executor.submit(
-                    _run_transcription_sync, analysis_id, audio_path
-                )
-            
-            # Submit voice analysis
+
+            # Submit voice analysis (transcription already done)
             if has_audio:
                 futures["voice"] = executor.submit(
                     _run_voice_analysis_sync, analysis_id, audio_path
                 )
-            
+
             # Sub-sample frames for facial/pose (cap at 30 for speed)
             MAX_ANALYSIS_FRAMES = 30
             if len(person_frames) > MAX_ANALYSIS_FRAMES:
@@ -634,34 +702,26 @@ def run_full_analysis(
                 logger.info(f"Sub-sampled {len(person_frames)} frames to {len(sampled_frames)} for analysis")
             else:
                 sampled_frames = person_frames
-            
-            # Submit facial analysis (only if a face/person was detected)
+
+            # Submit facial/pose analysis (only if a face/person was detected)
             if not is_audio_only and sampled_frames and face_detected_in_video:
                 futures["facial"] = executor.submit(
                     _run_facial_analysis_sync, analysis_id, sampled_frames
                 )
-            elif not is_audio_only and not face_detected_in_video:
-                facial_result = {"skipped": True, "reason": "No face/person detected in video", "overall_score": 0}
-            
-            # Submit pose analysis (only if a face/person was detected)
-            if not is_audio_only and sampled_frames and face_detected_in_video:
                 futures["pose"] = executor.submit(
                     _run_pose_analysis_sync, analysis_id, sampled_frames
                 )
             elif not is_audio_only and not face_detected_in_video:
+                facial_result = {"skipped": True, "reason": "No face/person detected in video", "overall_score": 0}
                 pose_result = {"skipped": True, "reason": "No face/person detected in video", "overall_score": 0}
-            
-            # Collect results as they complete
+
             for name, future in futures.items():
                 try:
                     result = future.result()
                     elapsed = time.time() - phase2_start
                     duration = result.pop("_duration", None)
                     dur_str = f" (task={duration:.1f}s)" if duration else ""
-                    if name == "transcription":
-                        transcription_result = result
-                        logger.info(f"Transcription completed at {elapsed:.1f}s{dur_str}")
-                    elif name == "voice":
+                    if name == "voice":
                         voice_result = result
                         logger.info(f"Voice analysis completed at {elapsed:.1f}s{dur_str}")
                     elif name == "facial":
@@ -672,15 +732,13 @@ def run_full_analysis(
                         logger.info(f"Pose analysis completed at {elapsed:.1f}s{dur_str}")
                 except Exception as e:
                     logger.error(f"{name} analysis failed: {e}")
-        
-        run_async(update_status(AnalysisStatus.ANALYZING_CONTENT, 75))
-        logger.info(f"Phase 2 complete in {time.time()-phase2_start:.1f}s. All parallel analyses finished.")
-        
+
+        logger.info(f"Gate precheck + main analysis complete in {time.time()-phase2_start:.1f}s")
+
         # ============================================================
-        # PHASE 3: Content analysis (needs transcript text)
+        # PHASE 4: Content analysis (needs transcript text)
         # ============================================================
         phase3_start = time.time()
-        transcript_text = transcription_result.get("text", "")
         if transcript_text and not transcription_result.get("skipped"):
             logger.info("Running content analysis...")
             content_result = _run_content_analysis_sync(
@@ -691,8 +749,8 @@ def run_full_analysis(
         else:
             logger.info("Skipping content analysis (no transcript available)")
             content_result = {"skipped": True, "reason": "No transcript available"}
-        
-        logger.info(f"Phase 3 (content) complete in {time.time()-phase3_start:.1f}s")
+
+        logger.info(f"Phase 4 (content) complete in {time.time()-phase3_start:.1f}s")
         
         # ============================================================
         # PHASE 4: Comparison + Report (needs all results)
@@ -812,10 +870,16 @@ def _extract_audio_sync(video_path: str, output_path: str) -> Dict[str, Any]:
         logger.info(f"Extracting audio from {video_path}")
         
         video = VideoFileClip(video_path)
+        duration = float(video.duration or 0)
         audio = video.audio
         
         if audio is None:
-            return {"success": False, "error": "Video has no audio track"}
+            video.close()
+            return {
+                "success": False,
+                "error": "Video has no audio track",
+                "duration": duration,
+            }
         
         # Export as WAV for best quality analysis
         audio.write_audiofile(
@@ -827,7 +891,6 @@ def _extract_audio_sync(video_path: str, output_path: str) -> Dict[str, Any]:
             logger=None,
         )
         
-        duration = video.duration
         video.close()
         
         return {
@@ -839,7 +902,36 @@ def _extract_audio_sync(video_path: str, output_path: str) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Audio extraction failed: {e}")
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e),
+            "duration": _get_video_duration_sync(video_path),
+        }
+
+
+def _get_video_duration_sync(video_path: str) -> float:
+    """Get video duration in seconds using lightweight fallbacks."""
+    try:
+        from moviepy.editor import VideoFileClip
+        video = VideoFileClip(video_path)
+        duration = float(video.duration or 0)
+        video.close()
+        return duration
+    except Exception:
+        pass
+
+    try:
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        cap.release()
+        if fps and fps > 0 and frame_count and frame_count > 0:
+            return float(frame_count / fps)
+    except Exception:
+        pass
+
+    return 0.0
 
 
 def _extract_frames_sync(video_path: str, output_dir: str, fps: float = 1.0) -> Dict[str, Any]:

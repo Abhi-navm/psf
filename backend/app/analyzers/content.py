@@ -55,11 +55,12 @@ class ContentAnalyzer:
         """Initialize the content analyzer."""
         self._llm_client = None
         self._groq_client = None
-        self._llm_backend = None  # "ollama" or "groq"
+        self._anthropic_client = None
+        self._llm_backend = None  # "ollama", "anthropic", or "groq"
     
     @property
     def llm_client(self):
-        """Lazy load LLM client — try Ollama first, then Groq."""
+        """Lazy load LLM client — try Ollama first, then Claude, then Groq."""
         if self._llm_client is None and self._llm_backend is None:
             # Try Ollama first (local dev)
             try:
@@ -72,8 +73,20 @@ class ContentAnalyzer:
             except Exception:
                 pass
             
+            # Fall back to Claude (Anthropic)
+            if self._llm_client is None and settings.anthropic_api_key:
+                try:
+                    import anthropic
+                    self._anthropic_client = anthropic.Anthropic(
+                        api_key=settings.anthropic_api_key
+                    )
+                    self._llm_backend = "anthropic"
+                    logger.info(f"Using Claude API ({settings.anthropic_model})")
+                except Exception as e:
+                    logger.warning(f"Could not initialize Anthropic client: {e}")
+            
             # Fall back to Groq
-            if self._llm_client is None and settings.groq_api_key:
+            if self._llm_backend is None and settings.groq_api_key:
                 try:
                     from groq import Groq
                     self._groq_client = Groq(api_key=settings.groq_api_key)
@@ -84,7 +97,7 @@ class ContentAnalyzer:
             
             if self._llm_backend is None:
                 self._llm_backend = "none"
-                logger.warning("No LLM backend available (no Ollama, no Groq API key)")
+                logger.warning("No LLM backend available (no Ollama, no ANTHROPIC_API_KEY, no GROQ_API_KEY)")
         
         return self._llm_client
     
@@ -103,6 +116,19 @@ class ContentAnalyzer:
                 return response.get("response", "").strip()
             except Exception as e:
                 logger.warning(f"Ollama generation failed: {e}")
+                return None
+        
+        if self._llm_backend == "anthropic" and self._anthropic_client:
+            try:
+                message = self._anthropic_client.messages.create(
+                    model=settings.anthropic_model,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                )
+                return message.content[0].text.strip()
+            except Exception as e:
+                logger.warning(f"Claude generation failed: {e}")
                 return None
         
         if self._llm_backend == "groq" and self._groq_client:
@@ -142,6 +168,9 @@ class ContentAnalyzer:
         
         segments = segments or []
         
+        # Note: Relevance check is now done as a precheck gate BEFORE main analysis starts.
+        # This analyze() method focuses purely on content analysis without gate logic.
+        
         # Detect filler words
         filler_analysis = self._detect_filler_words(transcript, segments)
         
@@ -165,7 +194,7 @@ class ContentAnalyzer:
             len(transcript.split())
         )
         
-        return {
+        result = {
             "overall_score": scores["overall"],
             "clarity_score": scores["clarity"],
             "persuasion_score": scores["persuasion"],
@@ -177,7 +206,66 @@ class ContentAnalyzer:
             "key_points": key_points,
             "llm_feedback": llm_feedback,
         }
+
+        return result
     
+    def classify_relevance(self, transcript: str) -> Dict[str, Any]:
+        """Use LLM to determine if the transcript is a sales pitch or business presentation.
+
+        Returns a dict:
+            is_relevant  – bool
+            confidence   – float 0–1
+            reason       – short explanation from the LLM
+        """
+        # Ensure backend is detected before logging
+        _ = self.llm_client
+        if self._llm_backend == "none":
+            logger.warning("Relevance check skipped: no LLM backend configured (set OLLAMA or GROQ_API_KEY)")
+            return {"is_relevant": True, "confidence": 0.0, "reason": "No LLM backend configured — check skipped"}
+
+        logger.info(f"Running relevance classifier via {self._llm_backend}")
+        prompt = f"""You are a strict content classifier for a sales pitch analysis tool.
+
+RELEVANT content (is_relevant: true) includes:
+- Sales pitches, product or service demos
+- Investor or funding pitches
+- Business proposals or presentations
+- Client discovery or qualification calls
+- Marketing or promotional speeches
+- Job candidate pitching themselves
+
+NOT RELEVANT (is_relevant: false) includes:
+- Casual conversation or small talk
+- Educational lectures unrelated to selling
+- Personal stories with no commercial intent
+- Technical meetings with no persuasion goal
+- Random speech, noise, or incoherent content
+
+Transcript excerpt (first 2000 chars):
+\"\"\"{transcript[:2000]}\"\"\"
+
+Reply in valid JSON only:
+{{"is_relevant": true, "confidence": 0.95, "reason": "one-sentence explanation referencing specific content"}}"""
+
+        response_text = self._llm_generate(prompt, max_tokens=120, temperature=0.1)
+
+        if response_text:
+            try:
+                import json
+                match = re.search(r'\{[^{}]+\}', response_text, re.DOTALL)
+                if match:
+                    data = json.loads(match.group())
+                    return {
+                        "is_relevant": bool(data.get("is_relevant", True)),
+                        "confidence": float(data.get("confidence", 0.5)),
+                        "reason": str(data.get("reason", "")),
+                    }
+            except Exception as e:
+                logger.warning(f"Relevance classifier JSON parsing failed: {e}")
+
+        # Default: assume relevant when LLM is unavailable so analysis is never silently dropped
+        return {"is_relevant": True, "confidence": 0.5, "reason": "LLM unavailable — defaulting to relevant"}
+
     def _detect_filler_words(
         self, 
         transcript: str, 
